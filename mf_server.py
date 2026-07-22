@@ -98,7 +98,7 @@ def _extract_rubric(text: str) -> dict:
     return out
 
 
-def _ask(prompt: str, audio_paths: list) -> dict:
+def _ask(prompt: str, audio_paths: list, gen: dict = None) -> dict:
     import torch
     model, processor = _load()
     content = [{"type": "text", "text": prompt}]
@@ -123,9 +123,15 @@ def _ask(prompt: str, audio_paths: list) -> dict:
     import contextlib
     ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
            if torch.cuda.is_available() else contextlib.nullcontext())
+    # greedy(do_sample=False)는 이 모델에서 템플릿 복사·반복 루프에 빠진다
+    # ("no lyrics" 무한 반복 실측) → 약한 샘플링 + 반복 페널티가 정답.
+    # 결정성은 3회 채점 중앙값이 대신 확보한다.
+    gk = {"max_new_tokens": MAX_NEW_TOKENS, "do_sample": True,
+          "temperature": 0.4, "top_p": 0.9, "repetition_penalty": 1.15,
+          "no_repeat_ngram_size": 8, "use_cache": True}
+    gk.update(gen or {})
     with ctx:
-        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
-                             do_sample=False, use_cache=True)
+        out = model.generate(**inputs, **gk)
     text = processor.batch_decode(
         out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     print(f"── 생성 원문 ({len(text)}자): {text[:300]}{'…' if len(text) > 300 else ''}")
@@ -175,6 +181,7 @@ class Req(BaseModel):
     audio_b64_b: str = ""          # compare B
     audio_b64s: list = []          # 다지점 발췌 (rubric — A/B/C 순)
     audio_name: str = "a.mp3"
+    gen: dict = {}                 # 생성 파라미터 오버라이드 (temperature 등)
 
 
 @app.get("/health")
@@ -198,7 +205,10 @@ def handle(r: Req):
             paths.append(f.name)
         # 클라이언트가 발췌들을 무음 간격으로 합친 '단일 오디오'를 보낸다
         # (MF 프로세서는 텍스트:오디오 1:1 제약) — 프롬프트에 구조 설명 포함됨
-        return _ask(r.prompt, paths)
+        allowed = {"temperature", "top_p", "repetition_penalty",
+                   "no_repeat_ngram_size", "max_new_tokens", "do_sample"}
+        return _ask(r.prompt, paths,
+                    {k: v for k, v in (r.gen or {}).items() if k in allowed})
     finally:
         for p in paths:
             try:
