@@ -261,11 +261,20 @@ class Req(BaseModel):
     gen: dict = {}                 # 생성 파라미터 오버라이드 (temperature 등)
 
 
+def _enforcer_available() -> bool:
+    try:
+        import lmformatenforcer  # noqa
+        return True
+    except ImportError:
+        return False
+
+
 @app.get("/health")
 def health():
     import torch
-    return {"status": "ok", "version": "v3-norm", "model_loaded": _model is not None,
+    return {"status": "ok", "version": "v4-schema", "model_loaded": _model is not None,
             "cuda": torch.cuda.is_available(),
+            "enforcer": _enforcer_available(),   # False면 스키마 불일치가 잦아진다
             "device": (str(_model.device) if _model is not None else "unloaded")}
 
 
