@@ -117,8 +117,15 @@ def _ask(prompt: str, audio_paths: list) -> dict:
         if torch.is_tensor(v) and v.dtype == torch.float64:
             inputs[k] = v.to(torch.float32)
     inputs = inputs.to(model.device)
-    out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
-                         do_sample=False, use_cache=True)
+    # autocast 필수: 모델에 bf16 모듈(conv1d)과 fp32 고정 모듈(layer_norm)이
+    # 섞여 있어 입력을 한쪽에 맞추면 반대쪽이 죽는다 — autocast 가 연산별로
+    # conv 는 bf16, layer_norm 은 fp32 로 자동 캐스팅해 양쪽을 만족시킨다.
+    import contextlib
+    ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+           if torch.cuda.is_available() else contextlib.nullcontext())
+    with ctx:
+        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
+                             do_sample=False, use_cache=True)
     text = processor.batch_decode(
         out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     parsed = _parse_json(text, {})
