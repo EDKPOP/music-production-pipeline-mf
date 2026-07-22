@@ -140,6 +140,8 @@ def _ask(prompt: str, audio_paths: list, gen: dict = None,
     text = processor.batch_decode(
         out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     print(f"── 생성 원문 ({len(text)}자): {text[:300]}{'…' if len(text) > 300 else ''}")
+    if mode == "text":  # 평문 모드 — 정규화·스키마 강제 없음, 전문 그대로
+        return {"text": text}
     if mode == "structure":  # 구조 분석은 루브릭 정규화를 거치지 않음
         out = _parse_json(text, {})
         if isinstance(out, dict):
@@ -272,7 +274,7 @@ def _enforcer_available() -> bool:
 @app.get("/health")
 def health():
     import torch
-    return {"status": "ok", "version": "v4-schema", "model_loaded": _model is not None,
+    return {"status": "ok", "version": "v5-text", "model_loaded": _model is not None,
             "cuda": torch.cuda.is_available(),
             "enforcer": _enforcer_available(),   # False면 스키마 불일치가 잦아진다
             "device": (str(_model.device) if _model is not None else "unloaded")}
