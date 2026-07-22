@@ -108,12 +108,14 @@ def _ask(prompt: str, audio_paths: list) -> dict:
         [{"role": "user", "content": content}],
         tokenize=True, add_generation_prompt=True, return_dict=True,
     )
-    dtype = getattr(model, "dtype", None)  # 피처 dtype 정합 (float64 방지)
-    if dtype is not None:
-        for k in list(inputs.keys()):
-            v = inputs[k]
-            if torch.is_tensor(v) and torch.is_floating_point(v):
-                inputs[k] = v.to(dtype)
+    # dtype 주의: float64만 float32로 강등. float32를 bf16으로 내리면 안 됨 —
+    # 오디오 인코더 layer_norm 이 float32 입력을 기대해
+    # "expected scalar type Float but found BFloat16" 로 죽는다.
+    # CUDA에서는 모델이 내부에서 정밀도를 알아서 관리한다.
+    for k in list(inputs.keys()):
+        v = inputs[k]
+        if torch.is_tensor(v) and v.dtype == torch.float64:
+            inputs[k] = v.to(torch.float32)
     inputs = inputs.to(model.device)
     out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS,
                          do_sample=False, use_cache=True)
