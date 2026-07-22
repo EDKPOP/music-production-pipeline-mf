@@ -87,9 +87,25 @@ curl http://192.168.0.23:8400/health
 가속)을 끄세요. 8GB VRAM이면 `mf_server.py`의 `torch_dtype`은 이미 bf16(≈16GB→
 GPU가 절반을 시스템 램에 오프로딩)이라 느려질 수 있습니다 — 12GB+ 권장.
 
-**Q. 맥에서 /health 가 안 열린다** → 같은 네트워크인지, 방화벽 허용을 눌렀는지,
-윈도우 IP가 바뀌지 않았는지(`ipconfig`) 확인. 공유기에서 IP 고정(DHCP 예약)을
-걸어두면 편합니다.
+**Q. 맥에서 /health 가 안 열린다** → 순서대로 (관리자 PowerShell):
+
+```powershell
+# 1) 서버 자체 확인 (윈도우에서 — JSON 나오면 서버는 정상, 방화벽 문제)
+curl.exe http://localhost:8400/health
+
+# 2) 네트워크를 '개인(Private)'으로 — 공용(Public)이면 인바운드 전체 차단됨
+Set-NetConnectionProfile -NetworkCategory Private
+
+# 3) 방화벽 인바운드 허용 규칙
+New-NetFirewallRule -DisplayName "songcamp-mf 8400" -Direction Inbound -Protocol TCP -LocalPort 8400 -Action Allow -Profile Private,Domain
+
+# 4) IP 확인 후 맥에서 curl http://IP:8400/health
+ipconfig
+```
+
+그래도 안 되면: 맥과 같은 공유기인지(게스트 Wi-Fi는 기기 간 통신 차단 — AP 격리),
+공유기의 "AP 격리" 옵션 여부 확인. IP 고정(DHCP 예약)을 걸어두면 재부팅 후에도
+주소가 안 바뀝니다.
 
 ## 프로토콜 (참고)
 
