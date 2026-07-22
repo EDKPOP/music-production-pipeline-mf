@@ -98,7 +98,8 @@ def _extract_rubric(text: str) -> dict:
     return out
 
 
-def _ask(prompt: str, audio_paths: list, gen: dict = None) -> dict:
+def _ask(prompt: str, audio_paths: list, gen: dict = None,
+         mode: str = "rubric") -> dict:
     import torch
     model, processor = _load()
     content = [{"type": "text", "text": prompt}]
@@ -130,6 +131,10 @@ def _ask(prompt: str, audio_paths: list, gen: dict = None) -> dict:
           "temperature": 0.4, "top_p": 0.9, "repetition_penalty": 1.15,
           "no_repeat_ngram_size": 8, "use_cache": True}
     gk.update(gen or {})
+    fn = _enforcer(processor.tokenizer, mode)
+    if fn is not None:
+        gk["prefix_allowed_tokens_fn"] = fn
+        gk.pop("no_repeat_ngram_size", None)  # 스키마 강제와 충돌 방지
     with ctx:
         out = model.generate(**inputs, **gk)
     text = processor.batch_decode(
@@ -139,6 +144,54 @@ def _ask(prompt: str, audio_paths: list, gen: dict = None) -> dict:
 
 
 _CRIT = ("hook", "production", "structure", "vocal")
+
+# ── JSON 스키마 강제 디코딩 (lm-format-enforcer — 설치 시 자동 활성) ──
+# 토큰 선택 단계에서 스키마에 맞는 토큰만 허용 → 포맷 이탈이 원천 불가능.
+#   pip install lm-format-enforcer
+_C = {"type": "object",
+      "properties": {"score": {"type": "number", "minimum": 1, "maximum": 5},
+                     "evidence": {"type": "string", "maxLength": 140}},
+      "required": ["score", "evidence"]}
+RUBRIC_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "heard": {"type": "object",
+                  "properties": {k: {"type": "string", "maxLength": 120}
+                                 for k in ("A", "B", "C")},
+                  "required": ["A", "B", "C"]},
+        "hook": _C, "production": _C, "structure": _C, "vocal": _C,
+        "first_impression": {"type": "string", "maxLength": 200},
+        "development": {"type": "string", "maxLength": 200},
+        "one_line_note": {"type": "string", "maxLength": 200},
+        "target_audience": {"type": "string", "maxLength": 80},
+    },
+    "required": ["heard", "hook", "production", "structure", "vocal",
+                 "first_impression", "development", "one_line_note",
+                 "target_audience"],
+}
+_ENFORCER = {}
+
+
+def _enforcer(tokenizer, mode: str):
+    """모드별 prefix_allowed_tokens_fn (없으면 None — 자유 생성 + 복구 파서)."""
+    if mode in _ENFORCER:
+        return _ENFORCER[mode]
+    fn = None
+    if mode == "rubric":
+        try:
+            from lmformatenforcer import JsonSchemaParser
+            from lmformatenforcer.integrations.transformers import \
+                build_transformers_prefix_allowed_tokens_fn
+            fn = build_transformers_prefix_allowed_tokens_fn(
+                tokenizer, JsonSchemaParser(RUBRIC_SCHEMA))
+            print("✓ JSON 스키마 강제 디코딩 활성 (lm-format-enforcer)")
+        except ImportError:
+            print("… lm-format-enforcer 미설치 — 자유 생성 + 복구 파서로 동작"
+                  " (pip install lm-format-enforcer 권장)")
+        except Exception as e:
+            print(f"… 스키마 강제 비활성({type(e).__name__}) — 자유 생성으로 동작")
+    _ENFORCER[mode] = fn
+    return fn
 
 
 def _normalize(p, text: str) -> dict:
@@ -208,7 +261,8 @@ def handle(r: Req):
         allowed = {"temperature", "top_p", "repetition_penalty",
                    "no_repeat_ngram_size", "max_new_tokens", "do_sample"}
         return _ask(r.prompt, paths,
-                    {k: v for k, v in (r.gen or {}).items() if k in allowed})
+                    {k: v for k, v in (r.gen or {}).items() if k in allowed},
+                    mode=r.mode)
     finally:
         for p in paths:
             try:

@@ -7,3 +7,4 @@ soundfile
 fastapi
 uvicorn
 pydantic
+lm-format-enforcer      # JSON 스키마 강제 디코딩 — 포맷 오류 원천 차단 (권장)
