@@ -26,7 +26,7 @@ from pydantic import BaseModel
 app = FastAPI(title="mf-server", docs_url=None)
 _model = _processor = None
 MODEL_ID = "nvidia/music-flamingo-2601-hf"
-MAX_NEW_TOKENS = 224
+MAX_NEW_TOKENS = 448  # 상세 루브릭 (heard A/B/C·첫인상·전개·타깃 청중)
 
 
 def _load():
@@ -80,10 +80,21 @@ def _extract_rubric(text: str) -> dict:
         if not m:
             return {}
         out[k] = {"score": float(m.group(1)), "evidence": m.group(2) or ""}
-    for k in ("heard", "one_line_note"):
+    for k in ("one_line_note", "first_impression", "development",
+              "target_audience"):
         m = re.search(rf'"{k}"\s*:\s*"([^"]*)"', text)
         if m:
             out[k] = m.group(1)
+    m = re.search(r'"heard"\s*:\s*"([^"]*)"', text)
+    if m:
+        out["heard"] = m.group(1)
+    else:  # 객체형 heard {"A":..,"B":..,"C":..}
+        m = re.search(r'"heard"\s*:\s*\{(.*?)\}', text, re.S)
+        if m:
+            out["heard"] = {kk: vv for kk, vv in
+                            re.findall(r'"([ABC])"\s*:\s*"([^"]*)"', m.group(1))}
+    if not out.get("heard"):
+        out["heard"] = "(JSON 복구 — heard 원문 일부 유실)"
     return out
 
 
@@ -119,8 +130,9 @@ def _ask(prompt: str, audio_paths: list) -> dict:
 class Req(BaseModel):
     mode: str
     prompt: str
-    audio_b64: str
-    audio_b64_b: str = ""
+    audio_b64: str = ""            # 단일 클립 (compare A / 구버전 호환)
+    audio_b64_b: str = ""          # compare B
+    audio_b64s: list = []          # 다지점 발췌 (rubric — A/B/C 순)
     audio_name: str = "a.mp3"
 
 
@@ -135,16 +147,19 @@ def health():
 @app.post("/")
 def handle(r: Req):
     import os
+    b64s = r.audio_b64s or [b for b in [r.audio_b64, r.audio_b64_b] if b]
     paths = []
     try:
-        for b64 in [r.audio_b64] + ([r.audio_b64_b] if r.audio_b64_b else []):
-            f = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        for b64 in b64s:
+            f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             f.write(base64.b64decode(b64))
             f.close()
             paths.append(f.name)
         prompt = r.prompt
         if r.mode == "compare":
             prompt += "\n(First audio = Track A, second = Track B.)"
+        elif len(paths) >= 3:
+            prompt += "\n(Audio order: first = Excerpt A, second = B, third = C.)"
         return _ask(prompt, paths)
     finally:
         for p in paths:
