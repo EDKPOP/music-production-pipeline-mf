@@ -155,12 +155,9 @@ def handle(r: Req):
             f.write(base64.b64decode(b64))
             f.close()
             paths.append(f.name)
-        prompt = r.prompt
-        if r.mode == "compare":
-            prompt += "\n(First audio = Track A, second = Track B.)"
-        elif len(paths) >= 3:
-            prompt += "\n(Audio order: first = Excerpt A, second = B, third = C.)"
-        return _ask(prompt, paths)
+        # 클라이언트가 발췌들을 무음 간격으로 합친 '단일 오디오'를 보낸다
+        # (MF 프로세서는 텍스트:오디오 1:1 제약) — 프롬프트에 구조 설명 포함됨
+        return _ask(r.prompt, paths)
     finally:
         for p in paths:
             try:
