@@ -50,7 +50,7 @@ def _load():
             torch_dtype=(torch.bfloat16 if torch.cuda.is_available()
                          else torch.float32))
         try:
-            _model.generation_config.max_length = 4096
+            _model.generation_config.max_length = 16384  # 전곡 구조 분석용
         except Exception:
             pass
         print(f"로딩 완료. device={_model.device}")
@@ -140,6 +140,11 @@ def _ask(prompt: str, audio_paths: list, gen: dict = None,
     text = processor.batch_decode(
         out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
     print(f"── 생성 원문 ({len(text)}자): {text[:300]}{'…' if len(text) > 300 else ''}")
+    if mode == "structure":  # 구조 분석은 루브릭 정규화를 거치지 않음
+        out = _parse_json(text, {})
+        if isinstance(out, dict):
+            out["_raw"] = text[:800]
+        return out
     return _normalize(_parse_json(text, {}), text)
 
 
@@ -169,6 +174,24 @@ RUBRIC_SCHEMA = {
                  "first_impression", "development", "one_line_note",
                  "target_audience"],
 }
+STRUCTURE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "bpm": {"type": "number"},
+        "sections": {"type": "array", "minItems": 3, "maxItems": 20,
+                     "items": {"type": "object",
+                               "properties": {
+                                   "label": {"type": "string",
+                                             "enum": ["intro", "verse",
+                                                      "pre-chorus", "chorus",
+                                                      "bridge", "instrumental",
+                                                      "outro"]},
+                                   "start": {"type": "number"},
+                                   "end": {"type": "number"}},
+                               "required": ["label", "start", "end"]}},
+    },
+    "required": ["bpm", "sections"],
+}
 _ENFORCER = {}
 
 
@@ -177,13 +200,14 @@ def _enforcer(tokenizer, mode: str):
     if mode in _ENFORCER:
         return _ENFORCER[mode]
     fn = None
-    if mode == "rubric":
+    schema = {"rubric": RUBRIC_SCHEMA, "structure": STRUCTURE_SCHEMA}.get(mode)
+    if schema is not None:
         try:
             from lmformatenforcer import JsonSchemaParser
             from lmformatenforcer.integrations.transformers import \
                 build_transformers_prefix_allowed_tokens_fn
             fn = build_transformers_prefix_allowed_tokens_fn(
-                tokenizer, JsonSchemaParser(RUBRIC_SCHEMA))
+                tokenizer, JsonSchemaParser(schema))
             print("✓ JSON 스키마 강제 디코딩 활성 (lm-format-enforcer)")
         except ImportError:
             print("… lm-format-enforcer 미설치 — 자유 생성 + 복구 파서로 동작"
