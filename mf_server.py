@@ -128,12 +128,44 @@ def _ask(prompt: str, audio_paths: list) -> dict:
                              do_sample=False, use_cache=True)
     text = processor.batch_decode(
         out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-    parsed = _parse_json(text, {})
-    if '"hook"' in text and not (isinstance(parsed, dict) and parsed.get("hook")):
-        repaired = _extract_rubric(text)
-        if repaired:
-            return repaired
-    return parsed
+    print(f"── 생성 원문 ({len(text)}자): {text[:300]}{'…' if len(text) > 300 else ''}")
+    return _normalize(_parse_json(text, {}), text)
+
+
+_CRIT = ("hook", "production", "structure", "vocal")
+
+
+def _normalize(p, text: str) -> dict:
+    """모델 출력의 흔한 변형을 스키마로 정규화 + 실패 시 정규식 복구.
+
+    흡수하는 변형: 대문자 키(Hook), scores 중첩({"scores":{...}}),
+    점수만 숫자로 온 경우("hook": 4), 마크다운 펜스 안 JSON.
+    항상 _raw(원문 일부)를 동봉해 본체에서 실패 원인을 볼 수 있게 한다.
+    """
+    if not isinstance(p, dict):
+        p = {}
+    q = {}
+    for k, v in p.items():
+        q[k.lower().strip() if isinstance(k, str) else k] = v
+    if isinstance(q.get("scores"), dict):
+        for k, v in q["scores"].items():
+            q.setdefault(str(k).lower().strip(), v)
+    for k in _CRIT:
+        v = q.get(k)
+        if isinstance(v, (int, float)) or (isinstance(v, str) and
+                                           v.replace(".", "").isdigit()):
+            q[k] = {"score": float(v), "evidence": ""}
+        elif isinstance(v, dict) and "score" not in v and "value" in v:
+            q[k] = {"score": v["value"], "evidence": v.get("evidence", "")}
+    ok = all(isinstance(q.get(k), dict) and q[k].get("score") is not None
+             for k in _CRIT)
+    if not ok:
+        rep = _extract_rubric(text)
+        if rep:
+            rep["_raw"] = text[:1000]
+            return rep
+    q["_raw"] = text[:1000]
+    return q
 
 
 class Req(BaseModel):
@@ -148,7 +180,7 @@ class Req(BaseModel):
 @app.get("/health")
 def health():
     import torch
-    return {"status": "ok", "model_loaded": _model is not None,
+    return {"status": "ok", "version": "v3-norm", "model_loaded": _model is not None,
             "cuda": torch.cuda.is_available(),
             "device": (str(_model.device) if _model is not None else "unloaded")}
 
