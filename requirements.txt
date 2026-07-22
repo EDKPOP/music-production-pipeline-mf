@@ -1,0 +1,9 @@
+# CUDA용 torch 는 README 3번 명령으로 별도 설치:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+transformers>=4.57
+accelerate
+librosa
+soundfile
+fastapi
+uvicorn
+pydantic
