@@ -17,9 +17,11 @@ import argparse
 import base64
 import json
 import re
+import os
 import tempfile
 
 import uvicorn
+from fastapi.responses import JSONResponse
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -45,10 +47,17 @@ def _load():
             print("  NVIDIA 드라이버와 CUDA용 PyTorch 설치를 확인하세요 (README 참고).")
         print(f"Music Flamingo 로딩: {MODEL_ID} (최초 실행 시 ~16GB 다운로드)…")
         _processor = AutoProcessor.from_pretrained(MODEL_ID)
-        _model = MFClass.from_pretrained(
-            MODEL_ID, device_map="auto",
-            torch_dtype=(torch.bfloat16 if torch.cuda.is_available()
-                         else torch.float32))
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        try:   # SDPA = 메모리 효율 어텐션 — 전곡(수 분) 오디오의 어텐션이
+               # eager로는 시퀀스² 로 폭발한다 (24GB에서 16GB+ 단일 할당 실측)
+            _model = MFClass.from_pretrained(
+                MODEL_ID, device_map="auto", torch_dtype=dtype,
+                attn_implementation="sdpa")
+            print("어텐션: sdpa (메모리 효율)")
+        except (TypeError, ValueError) as e:
+            print(f"⚠ sdpa 미지원({e}) — 기본 어텐션으로 로드 (긴 오디오 OOM 위험)")
+            _model = MFClass.from_pretrained(
+                MODEL_ID, device_map="auto", torch_dtype=dtype)
         try:
             _model.generation_config.max_length = 16384  # 전곡 구조 분석용
         except Exception:
@@ -274,10 +283,52 @@ def _enforcer_available() -> bool:
 @app.get("/health")
 def health():
     import torch
-    return {"status": "ok", "version": "v5-text", "model_loaded": _model is not None,
+    return {"status": "ok", "version": "v6-oomsafe", "model_loaded": _model is not None,
+            "max_audio_s": MAX_AUDIO_S,
             "cuda": torch.cuda.is_available(),
             "enforcer": _enforcer_available(),   # False면 스키마 불일치가 잦아진다
             "device": (str(_model.device) if _model is not None else "unloaded")}
+
+
+MAX_AUDIO_S = int(os.environ.get("MF_MAX_AUDIO_S", "420"))   # 서버 자기방어 상한
+
+
+def _clamp_wav(raw: bytes, max_s: int) -> bytes:
+    """RIFF/WAVE를 max_s초로 절단 (청크 워커 — ffmpeg의 LIST 등 부가 청크 대응).
+
+    클라이언트(ffmpeg -ac 1 -ar 16000 s16le)가 보내는 어떤 배치든 data 청크를
+    찾아 자르고 RIFF/data 크기를 보정한다. 파싱 불가 형식은 그대로 통과.
+    """
+    import struct
+    if len(raw) < 44 or raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        return raw
+    pos, sr, ch, bits, dpos, dlen = 12, 0, 0, 0, None, 0
+    try:
+        while pos + 8 <= len(raw):
+            cid = raw[pos:pos + 4]
+            csz = struct.unpack_from("<I", raw, pos + 4)[0]
+            if cid == b"fmt " and csz >= 16:
+                ch = struct.unpack_from("<H", raw, pos + 8 + 2)[0]
+                sr = struct.unpack_from("<I", raw, pos + 8 + 4)[0]
+                bits = struct.unpack_from("<H", raw, pos + 8 + 14)[0]
+            elif cid == b"data":
+                dpos, dlen = pos + 8, min(csz, len(raw) - pos - 8)
+                break
+            pos += 8 + csz + (csz & 1)
+    except struct.error:
+        return raw
+    if not dpos or not sr or not ch or not bits:
+        return raw
+    bps = sr * ch * (bits // 8)
+    keep = max_s * bps
+    if bps <= 0 or dlen <= keep:
+        return raw
+    end = dpos + keep
+    out = bytearray(raw[:end])
+    struct.pack_into("<I", out, 4, end - 8)        # RIFF chunk size
+    struct.pack_into("<I", out, dpos - 4, keep)    # data chunk size
+    print(f"⚠ 오디오 {dlen / bps:.0f}s > 상한 {max_s}s — 앞 {max_s}s로 절단")
+    return bytes(out)
 
 
 @app.post("/")
@@ -288,22 +339,40 @@ def handle(r: Req):
     try:
         for b64 in b64s:
             f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            f.write(base64.b64decode(b64))
+            f.write(_clamp_wav(base64.b64decode(b64), MAX_AUDIO_S))
             f.close()
             paths.append(f.name)
         # 클라이언트가 발췌들을 무음 간격으로 합친 '단일 오디오'를 보낸다
         # (MF 프로세서는 텍스트:오디오 1:1 제약) — 프롬프트에 구조 설명 포함됨
         allowed = {"temperature", "top_p", "repetition_penalty",
                    "no_repeat_ngram_size", "max_new_tokens", "do_sample"}
-        return _ask(r.prompt, paths,
-                    {k: v for k, v in (r.gen or {}).items() if k in allowed},
-                    mode=r.mode)
+        try:
+            return _ask(r.prompt, paths,
+                        {k: v for k, v in (r.gen or {}).items() if k in allowed},
+                        mode=r.mode)
+        except Exception as e:
+            import torch
+            oom = isinstance(e, torch.cuda.OutOfMemoryError) or                 "out of memory" in str(e).lower()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if oom:   # 명확한 신호로 반환 — 클라이언트가 더 짧은 오디오로 강등
+                print(f"✗ CUDA OOM — 캐시 비움. 클라이언트 강등 유도: {str(e)[:150]}")
+                return JSONResponse(status_code=507,
+                                    content={"error": "cuda_oom",
+                                             "detail": str(e)[:300]})
+            raise
     finally:
         for p in paths:
             try:
                 os.unlink(p)
             except OSError:
                 pass
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()   # 요청 간 단편화 누적 방지
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
