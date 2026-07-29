@@ -168,11 +168,17 @@ GatedRepoError 로 실패):
 
 ```powershell
 cd $HOME\stable-audio-3
-# CLI 실행파일 이름은 huggingface_hub 버전에 따라 다릅니다 — 아래 한 줄이 가장 확실
-.venv\Scripts\python.exe -c "from huggingface_hub import login; login()"
-# (토큰 입력 프롬프트가 뜹니다. 구버전이면 .venv\Scripts\hf.exe auth login 또는
-#  .venv\Scripts\huggingface-cli.exe login 도 동작)
+# 숨김 입력 프롬프트는 윈도우 콘솔에서 붙여넣기가 새는 경우가 있어(빈 값
+# 전송 → 400 Bad Request), 토큰을 명령에 직접 넣는 방식이 확실합니다.
+# hf_로 시작하는 본인 토큰으로 바꿔 실행:
+.venv\Scripts\python.exe -c "from huggingface_hub import login; login(token='hf_여기에_토큰')"
+
+# 확인 — 본인 HF 계정 이름이 출력되면 성공:
+.venv\Scripts\python.exe -c "from huggingface_hub import whoami; print(whoami()['name'])"
 ```
+
+> 토큰은 로컬 캐시에 저장되므로 위 명령은 한 번만 실행하면 됩니다.
+> 명령 기록에 토큰이 남는 게 싫다면 실행 후 `Clear-History` 를 한 번.
 
 ### 실행
 
