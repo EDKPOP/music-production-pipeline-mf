@@ -164,20 +164,39 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
     import torch
     model = _load_sa3()
     dur = inst.shape[1] / SR
-    phase(f"구간 재생성 (Stable Audio 3, {start_s:.1f}~{end_s:.1f}s / {dur:.0f}s)")
-    kwargs = dict(
-        # 공식 시그니처는 (sample_rate, audio) 순서 — README 예제(torchaudio.load
-        # 반환 순서)와 반대다. 뒤집으면 'int has no attribute to' 로 즉사 (실기 재현)
-        inpaint_audio=(SR, torch.from_numpy(inst)),
-        inpaint_mask_start_seconds=float(start_s),
-        inpaint_mask_end_seconds=float(end_s),
+    mode = (extra.get("mode") or "inpaint").lower()
+    common = dict(
         prompt=prompt,
         duration=dur,
         # 기본 sample_size 는 ~120s 상한 — 전곡 컨텍스트가 조용히 잘리지 않게
         # 곡 길이(+여유)만큼 명시한다 (모델 상한 380s 안쪽)
         sample_size=int(min(dur + 8.0, 380.0) * SR),
+        # 문서 기본 cfg_scale=1.0 은 프롬프트를 사실상 무시한다(공식 문서:
+        # 강한 준수는 7.0 권장) — 클라이언트가 안 보내면 7.0
+        cfg_scale=float(extra.get("cfg_scale") or 7.0),
     )
-    for k in ("seed", "steps", "cfg_scale"):     # 선택 파라미터 — API가 모르면 제거
+    if mode == "a2a":
+        # audio-to-audio: 원본 반주를 초기값으로 깔고 노이즈를 부분만 섞어
+        # 뼈대(멜로디·리듬)를 유지한 채 변형. 창 전체가 다시 그려지지만
+        # 마스크 밖은 이후 _splice 가 진짜 원본으로 되돌린다.
+        phase(f"구간 변형 (SA3 a2a, {start_s:.1f}~{end_s:.1f}s / {dur:.0f}s, "
+              f"노이즈 {float(extra.get('strength') or 0.55):.2f})")
+        kwargs = dict(
+            init_audio=(SR, torch.from_numpy(inst)),
+            init_noise_level=min(max(float(extra.get("strength") or 0.55), 0.1), 1.0),
+            **common,
+        )
+    else:
+        phase(f"구간 재생성 (Stable Audio 3, {start_s:.1f}~{end_s:.1f}s / {dur:.0f}s)")
+        kwargs = dict(
+            # 공식 시그니처는 (sample_rate, audio) 순서 — README 예제(torchaudio.load
+            # 반환 순서)와 반대다. 뒤집으면 'int has no attribute to' 로 즉사 (실기 재현)
+            inpaint_audio=(SR, torch.from_numpy(inst)),
+            inpaint_mask_start_seconds=float(start_s),
+            inpaint_mask_end_seconds=float(end_s),
+            **common,
+        )
+    for k in ("seed", "steps"):                  # 선택 파라미터 — API가 모르면 제거
         if extra.get(k) is not None:
             kwargs[k] = extra[k]
     try:
@@ -344,7 +363,9 @@ class EditReq(BaseModel):
     keep_vocals: bool = True
     seed: int = None
     steps: int = None
-    cfg_scale: float = None
+    cfg_scale: float = None      # 미지정 시 7.0 (프롬프트 준수 강도)
+    mode: str = "inpaint"        # "inpaint"=다시 그리기 | "a2a"=원본 유지 변형
+    strength: float = None       # a2a 노이즈 강도 0.1~1.0 (기본 0.55)
 
 
 def _busy() -> bool:
@@ -382,7 +403,7 @@ def edit(r: EditReq):
            "created": time.time(), "audio_b64": r.audio_b64,
            "start_s": r.start_s, "end_s": r.end_s, "prompt": r.prompt.strip(),
            "keep_vocals": r.keep_vocals, "seed": r.seed, "steps": r.steps,
-           "cfg_scale": r.cfg_scale}
+           "cfg_scale": r.cfg_scale, "mode": r.mode, "strength": r.strength}
     with _lock:
         _jobs[jid] = job
         _queue.append(job)
