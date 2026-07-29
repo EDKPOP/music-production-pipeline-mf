@@ -140,10 +140,20 @@ uv sync
 #      명시하세요 (activate+pip은 다른 환경의 pip을 잡아 조용히 어긋납니다)
 uv pip install --python .venv\Scripts\python.exe -r $HOME\songcamp-mf\requirements-sa3.txt
 
-# 4) 확인 — 두 줄 다 통과해야 합니다 (CUDA: True / deps OK)
-.venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available())"
+# 4) CUDA용 PyTorch 강제 (윈도우 함정 — MF 설치 3번과 같은 이유)
+#    ⚠ 윈도우에서 PyPI 기본 torch는 CPU 빌드입니다. uv sync/의존성 설치가
+#      CPU 빌드를 깔거나 '교체'할 수 있으므로 마지막에 CUDA 빌드로 덮습니다.
+uv pip install --python .venv\Scripts\python.exe --reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+# 5) 확인 — 두 줄 다 통과해야 합니다 (CUDA: True / deps OK)
+.venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available(), torch.__version__)"
 .venv\Scripts\python.exe -c "import uvicorn, fastapi, soundfile, demucs; print('deps OK')"
 ```
+
+> `CUDA: False` 가 나오면: torch 버전 끝에 `+cpu` 가 붙어 있는지 확인하고
+> 4번을 다시 실행하세요. 그래도 False면 `cu126` 대신 `cu124` 로 시도
+> (드라이버가 오래된 경우). requirements-sa3 를 재설치한 뒤에는 항상
+> 4번을 마지막에 한 번 더 — 의존성 해석이 torch를 CPU 빌드로 되돌릴 수 있습니다.
 
 ### 실행
 
