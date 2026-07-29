@@ -17,12 +17,20 @@ HTTP로 위임받아 처리한다. 파이프라인:
 프로토콜 (본체 songcamp/postprod/retouch.py 와 계약 — 임의 변경 금지):
   GET  /health          → {"status","version","cuda","model_loaded","max_audio_s"}
   POST /edit            → {"audio_b64": 44.1kHz 스테레오 wav의 b64,
-                           "start_s","end_s","prompt"[, "keep_vocals"=true,
-                           "seed","steps","cfg_scale"]} → {"job_id"}
+                           "edits": [{"start_s","end_s","prompt"
+                                      [,"mode","strength","cfg_scale","fill"]}]
+                           [, "keep_vocals"=true, "seed","steps"]} → {"job_id"}
+                          (구형 단건 start_s/end_s/prompt 도 계속 허용)
   GET  /jobs/{id}       → {"status":"queued|running|done|failed","phase",
                            "progress":0~1,"elapsed_s"[,"error"]}
   GET  /jobs/{id}/result→ {"audio_b64": 결과 전체 곡 wav b64, "sr":44100}
   OOM 시 잡 error = "cuda_oom" (본체가 이 문자열로 안내 분기)
+
+배치가 기본: 예약 여러 건을 한 잡으로 받아 디코드·보컬 분리를 1회만 하고
+반주 위에 구간별 생성(inpaint=전곡 컨텍스트 재생성 / a2a=구간±문맥 창을
+원본 초기값으로 변형)을 누적한 뒤, 마지막에 원본과 1회 합성한다.
+생성 구간은 원본 구간과 RMS 매칭(음량 꺼짐 방지), negative prompt 로
+음질 저하 어휘를 기본 차단한다.
 
 GPU 메모리: 이 PC는 MF 8B(~16GB)가 상주하므로 SA3(~6.5GB)+demucs는
 기본적으로 잡이 끝나면 언로드한다 (SA3_KEEP_LOADED=1 로 상주 전환).
@@ -43,8 +51,11 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v2-arbiter"
+VERSION = "sa3-v3-batch"
 SR = 44100
+A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
+NEG_PROMPT = ("low quality, muffled, lo-fi, noisy, distorted, degraded audio, "
+              "artifacts, harsh, tinny")
 MAX_AUDIO_S = float(os.environ.get("SA3_MAX_AUDIO_S", 370))  # 모델 상한 380s 아래 안전선
 # 기본은 '상주' — 리터치를 연달아 할 때 매번 로드하지 않는다. GPU가 MF에
 # 필요해지면 맥의 중재자가 POST /unload 로 내린다 (SA3_UNLOAD_EACH=1 이면
@@ -174,16 +185,19 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         # 문서 기본 cfg_scale=1.0 은 프롬프트를 사실상 무시한다(공식 문서:
         # 강한 준수는 7.0 권장) — 클라이언트가 안 보내면 7.0
         cfg_scale=float(extra.get("cfg_scale") or 7.0),
+        # 음질 저하 어휘 차단 (공식 문서의 negative_prompt)
+        negative_prompt=str(extra.get("negative") or NEG_PROMPT),
     )
     if mode == "a2a":
         # audio-to-audio: 원본 반주를 초기값으로 깔고 노이즈를 부분만 섞어
         # 뼈대(멜로디·리듬)를 유지한 채 변형. 창 전체가 다시 그려지지만
         # 마스크 밖은 이후 _splice 가 진짜 원본으로 되돌린다.
+        # (문서: 0.1=밀접한 변형, 0.5=중간 혼합, 1.0=원본 무시)
         phase(f"구간 변형 (SA3 a2a, {start_s:.1f}~{end_s:.1f}s / {dur:.0f}s, "
-              f"노이즈 {float(extra.get('strength') or 0.55):.2f})")
+              f"노이즈 {float(extra.get('strength') or 0.35):.2f})")
         kwargs = dict(
             init_audio=(SR, torch.from_numpy(inst)),
-            init_noise_level=min(max(float(extra.get("strength") or 0.55), 0.1), 1.0),
+            init_noise_level=min(max(float(extra.get("strength") or 0.35), 0.1), 1.0),
             **common,
         )
     else:
@@ -203,7 +217,7 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         out = model.generate(**kwargs)
     except TypeError as e:
         _log(f"⚠ 선택 파라미터 미지원({e}) — 기본 파라미터로 재시도")
-        for k in ("seed", "steps", "cfg_scale"):
+        for k in ("seed", "steps", "cfg_scale", "negative_prompt"):
             kwargs.pop(k, None)
         out = model.generate(**kwargs)
     if isinstance(out, tuple):                   # (tensor, sr) 형태 방어
@@ -222,6 +236,30 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         out = torchaudio.functional.resample(
             torch.from_numpy(out), out_sr, SR).numpy()
     return out
+
+
+def _align_len(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """생성 길이를 기준 오디오에 정렬 — 초과는 자르고 부족분은 기준으로 채움."""
+    d = gen.shape[1] - ref.shape[1]
+    if d == 0:
+        return gen
+    _log(f"  생성 길이 보정: {d:+d} 샘플")
+    if d > 0:
+        return gen[:, :ref.shape[1]]
+    return np.concatenate([gen, ref[:, gen.shape[1]:]], axis=1)
+
+
+def _match_rms(gen: np.ndarray, ref: np.ndarray, a: int, b: int) -> np.ndarray:
+    """생성 구간의 음량을 원본 구간에 맞춘다 — 구간만 조용해지는
+    '음질 다운' 인상 방지. 원본이 무음(빈 블록)이면 건드리지 않는다."""
+    ref_rms = float(np.sqrt(np.mean(ref[:, a:b] ** 2)))
+    gen_rms = float(np.sqrt(np.mean(gen[:, a:b] ** 2)))
+    if ref_rms < 1e-4 or gen_rms < 1e-4:
+        return gen
+    g = min(max(ref_rms / gen_rms, 0.5), 2.0)
+    if abs(g - 1.0) > 0.05:
+        _log(f"  RMS 매칭: ×{g:.2f}")
+    return gen * g
 
 
 def _splice(original: np.ndarray, generated: np.ndarray,
@@ -262,47 +300,72 @@ def _run_job(job: dict):
         phase("오디오 디코드", 0.05)
         wav = _decode_wav(job.pop("audio_b64"))
         dur = wav.shape[1] / SR
-        start, end = float(job["start_s"]), float(job["end_s"])
-        if not (0 <= start < end <= dur + 0.5):
-            raise ValueError(f"구간이 곡 길이를 벗어남: {start}~{end}s (곡 {dur:.1f}s)")
-        end = min(end, dur)
+        edits = job["edits"]
+        for e in edits:
+            s, t = float(e["start_s"]), float(e["end_s"])
+            if not (0 <= s < t <= dur + 0.5):
+                raise ValueError(f"구간이 곡 길이를 벗어남: {s}~{t}s (곡 {dur:.1f}s)")
+            e["start_s"], e["end_s"] = s, min(t, dur)
+        lo = min(e["start_s"] for e in edits)
+        hi = max(e["end_s"] for e in edits)
 
-        # 모델 상한 초과 곡 → 마스크를 중심에 둔 윈도우만 모델에 보낸다
+        # 모델 상한 초과 곡 → 수정 구간 묶음을 중심에 둔 윈도우만 모델에 보낸다
         off = 0.0
         full = wav
         if dur > MAX_AUDIO_S:
-            seg = end - start
-            off = max(0.0, min(start - (MAX_AUDIO_S - seg) / 2, dur - MAX_AUDIO_S))
+            if hi - lo > MAX_AUDIO_S:
+                raise ValueError(f"수정 구간들이 한 번에 처리 가능한 폭"
+                                 f"({MAX_AUDIO_S:.0f}s)을 넘습니다 — 예약을 나눠 실행하세요")
+            off = max(0.0, min(lo - (MAX_AUDIO_S - (hi - lo)) / 2, dur - MAX_AUDIO_S))
             a = int(off * SR)
             wav = wav[:, a:a + int(MAX_AUDIO_S * SR)]
             _log(f"  곡 {dur:.0f}s > {MAX_AUDIO_S:.0f}s — 윈도우 {off:.1f}s~ 적용")
 
-        phase("보컬/반주 분리 (demucs)", 0.15)
+        # 배치의 핵심: 디코드·분리를 잡당 1회만 하고 구간 생성만 누적한다
+        phase("보컬/반주 분리 (demucs) — 배치당 1회", 0.15)
         if job.get("keep_vocals", True):
-            vocals, inst = _separate(wav, lambda p: phase(p, 0.25))
+            vocals, inst = _separate(wav, lambda p: phase(p, 0.22))
         else:
             vocals, inst = np.zeros_like(wav), wav
 
-        phase("구간 재생성 (Stable Audio 3)", 0.45)
-        gen_inst = _inpaint(inst, start - off, end - off, job["prompt"],
-                            job, lambda p: phase(p, 0.5))
-        # 모델/리샘플 반올림으로 생성 길이가 ±수 샘플 어긋난다 — 원본 길이에
-        # 정렬 (초과는 자르고, 부족분은 원본 반주로 채움: 마스크 밖은 어차피
-        # _splice가 원본만 쓴다). 미정렬 시 vocals 합성에서 브로드캐스트 실패.
-        if gen_inst.shape[1] != inst.shape[1]:
-            d = gen_inst.shape[1] - inst.shape[1]
-            _log(f"  생성 길이 보정: {d:+d} 샘플")
-            if d > 0:
-                gen_inst = gen_inst[:, :inst.shape[1]]
+        inst_cur = inst.copy()
+        total = len(edits)
+        for i, e in enumerate(edits):
+            f0 = 0.3 + 0.55 * i / total
+            s_rel, t_rel = e["start_s"] - off, e["end_s"] - off
+            a, b = int(s_rel * SR), int(t_rel * SR)
+            opts = {k: e.get(k) for k in ("mode", "strength", "cfg_scale", "negative")}
+            for k in ("seed", "steps"):
+                if job.get(k) is not None:
+                    opts[k] = job[k]
+            tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
+            if (e.get("mode") or "inpaint").lower() == "a2a":
+                # 변형(a2a)은 구간±문맥 창만 — 짧은 창일수록 충실도·속도가 좋고,
+                # 창 밖 원본은 어차피 손대지 않는다
+                wa = max(0.0, s_rel - A2A_CTX_S)
+                wb = min(inst_cur.shape[1] / SR, t_rel + A2A_CTX_S)
+                ia, ib = int(wa * SR), int(wb * SR)
+                seg = np.ascontiguousarray(inst_cur[:, ia:ib])
+                gen = _inpaint(seg, s_rel - wa, t_rel - wa, e["prompt"], opts,
+                               lambda p: phase(f"{tagp} · {p}", f0))
+                gen = _align_len(gen, seg)
+                gen = _match_rms(gen, seg, a - ia, b - ia)
+                inst_cur[:, ia:ib] = _splice(seg, gen, s_rel - wa, t_rel - wa)
             else:
-                gen_inst = np.concatenate(
-                    [gen_inst, inst[:, gen_inst.shape[1]:]], axis=1)
+                gen = _inpaint(inst_cur, s_rel, t_rel, e["prompt"], opts,
+                               lambda p: phase(f"{tagp} · {p}", f0))
+                gen = _align_len(gen, inst_cur)
+                if not e.get("fill"):
+                    gen = _match_rms(gen, inst_cur, a, b)
+                inst_cur = _splice(inst_cur, gen, s_rel, t_rel)
 
-        phase("합성 (원본 스플라이스 + 보컬)", 0.88)
-        new_inst = _splice(inst, gen_inst, start - off, end - off)
-        mixed = new_inst + vocals
-        # 마스크 밖은 분리·재합성조차 거치지 않은 진짜 원본으로 되돌린다
-        result_win = _splice(wav, mixed, start - off, end - off)
+        phase("합성 (원본 스플라이스 + 보컬)", 0.9)
+        mixed = inst_cur + vocals
+        # 수정 구간만 mixed — 밖은 분리·재합성조차 거치지 않은 진짜 원본
+        result_win = wav
+        for e in edits:
+            result_win = _splice(result_win, mixed,
+                                 e["start_s"] - off, e["end_s"] - off)
         if off or result_win.shape[1] < full.shape[1]:
             out = full.copy()
             a = int(off * SR)
@@ -319,7 +382,7 @@ def _run_job(job: dict):
         job["sr"] = SR
         job["status"], job["phase"], job["progress"] = "done", "완료", 1.0
         _log(f"잡 {job['id'][:8]} 완료 — {time.time()-t0:.0f}s, "
-             f"구간 {start:.1f}~{end:.1f}s, 프롬프트: {job['prompt'][:60]}")
+             f"{total}건 {lo:.1f}~{hi:.1f}s")
     except Exception as e:
         oom = False
         try:
@@ -357,15 +420,16 @@ def _worker():
 
 class EditReq(BaseModel):
     audio_b64: str
-    start_s: float
-    end_s: float
-    prompt: str
+    edits: list = None           # [{start_s,end_s,prompt[,mode,strength,cfg_scale,fill,label,negative]}]
+    start_s: float = None        # ↓ 구형 단건 호환
+    end_s: float = None
+    prompt: str = ""
     keep_vocals: bool = True
     seed: int = None
     steps: int = None
     cfg_scale: float = None      # 미지정 시 7.0 (프롬프트 준수 강도)
     mode: str = "inpaint"        # "inpaint"=다시 그리기 | "a2a"=원본 유지 변형
-    strength: float = None       # a2a 노이즈 강도 0.1~1.0 (기본 0.55)
+    strength: float = None       # a2a 노이즈 강도 (문서: 0.1 밀접 · 0.5 중간 혼합)
 
 
 def _busy() -> bool:
@@ -396,19 +460,42 @@ def unload_model():
 
 @app.post("/edit")
 def edit(r: EditReq):
-    if not r.prompt.strip():
-        raise HTTPException(400, "prompt가 비어 있습니다")
+    if r.edits:
+        edits = []
+        for e in r.edits[:16]:
+            try:
+                edits.append({
+                    "start_s": float(e.get("start_s", e.get("start"))),
+                    "end_s": float(e.get("end_s", e.get("end"))),
+                    "prompt": str(e.get("prompt") or "").strip(),
+                    "mode": str(e.get("mode") or "inpaint"),
+                    "strength": e.get("strength"),
+                    "cfg_scale": e.get("cfg_scale"),
+                    "fill": bool(e.get("fill")),
+                    "label": str(e.get("label") or ""),
+                    "negative": e.get("negative"),
+                })
+            except (TypeError, ValueError):
+                raise HTTPException(400, "edits 형식 오류 — start_s/end_s/prompt 필수")
+        if any(not e["prompt"] for e in edits):
+            raise HTTPException(400, "prompt가 비어 있는 예약이 있습니다")
+    elif r.prompt.strip() and r.start_s is not None and r.end_s is not None:
+        edits = [{"start_s": float(r.start_s), "end_s": float(r.end_s),
+                  "prompt": r.prompt.strip(), "mode": r.mode,
+                  "strength": r.strength, "cfg_scale": r.cfg_scale,
+                  "fill": False, "label": "", "negative": None}]
+    else:
+        raise HTTPException(400, "edits 또는 start_s/end_s/prompt가 필요합니다")
     jid = uuid.uuid4().hex
     job = {"id": jid, "status": "queued", "phase": "대기열", "progress": 0.0,
-           "created": time.time(), "audio_b64": r.audio_b64,
-           "start_s": r.start_s, "end_s": r.end_s, "prompt": r.prompt.strip(),
-           "keep_vocals": r.keep_vocals, "seed": r.seed, "steps": r.steps,
-           "cfg_scale": r.cfg_scale, "mode": r.mode, "strength": r.strength}
+           "created": time.time(), "audio_b64": r.audio_b64, "edits": edits,
+           "keep_vocals": r.keep_vocals, "seed": r.seed, "steps": r.steps}
     with _lock:
         _jobs[jid] = job
         _queue.append(job)
-    _log(f"잡 접수 {jid[:8]} — {r.start_s:.1f}~{r.end_s:.1f}s, "
-         f"프롬프트: {r.prompt[:80]}")
+    _log(f"잡 접수 {jid[:8]} — {len(edits)}건 "
+         f"{min(e['start_s'] for e in edits):.1f}~{max(e['end_s'] for e in edits):.1f}s, "
+         f"첫 프롬프트: {edits[0]['prompt'][:70]}")
     return {"job_id": jid}
 
 
