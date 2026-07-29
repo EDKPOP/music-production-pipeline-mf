@@ -1,0 +1,7 @@
+# SA3 리터치 서버 추가 의존성 — stable-audio-3 의 uv 환경에 pip 로 얹는다
+# (torch/torchaudio 는 stable-audio-3 가 uv sync 로 이미 설치)
+fastapi
+uvicorn
+pydantic
+soundfile
+demucs

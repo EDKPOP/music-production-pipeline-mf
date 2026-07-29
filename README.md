@@ -116,7 +116,63 @@ ipconfig
 오디오는 본체가 훅 근처 20초 발췌를 base64로 보냅니다. 서버는 파일을 임시
 저장 후 즉시 삭제하며, 아무것도 디스크에 남기지 않습니다.
 
+## Stable Audio 3 리터치 서버 (선택 — 트랙 작업실 구간 리터치)
+
+트랙 작업실의 "이 구간만 프롬프트대로 고치기"를 담당하는 두 번째 서버입니다
+(포트 8500). 곡 전체를 받아 demucs로 보컬/반주를 분리하고, 반주만 Stable
+Audio 3 인페인팅으로 선택 구간을 재생성한 뒤, 마스크 밖 원본과 보컬을 그대로
+합쳐 돌려줍니다.
+
+### 설치 (PowerShell — 최초 1회)
+
+```powershell
+# 1) uv (파이썬 패키지 매니저) — 이미 있으면 생략
+winget install astral-sh.uv
+
+# 2) Stable Audio 3 코드 + 환경 (모델은 첫 실행 때 자동 다운로드)
+cd $HOME
+git clone https://github.com/Stability-AI/stable-audio-3.git
+cd stable-audio-3
+uv sync
+
+# 3) 서버 추가 의존성 (같은 환경에 얹기)
+.\.venv\Scripts\Activate.ps1
+pip install -r $HOME\songcamp-mf\requirements-sa3.txt
+
+# 4) GPU 확인 — True 가 나와야 합니다
+python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+```
+
+### 실행
+
+```powershell
+cd $HOME\songcamp-mf
+..\stable-audio-3\.venv\Scripts\Activate.ps1
+python sa3_server.py          # 기본 0.0.0.0:8500  (또는 run_sa3.bat 더블클릭)
+```
+
+방화벽 허용 (관리자 PowerShell, 최초 1회):
+
+```powershell
+New-NetFirewallRule -DisplayName "songcamp-sa3 8500" -Direction Inbound -Protocol TCP -LocalPort 8500 -Action Allow -Profile Private,Domain
+```
+
+맥 쪽 설정은 songcamp 웹 UI **⚙️ 설정/상태 탭의 SA3 주소** 칸에
+`http://윈도우IP:8500` 을 넣으면 됩니다. 확인: `curl http://윈도우IP:8500/health`
+
+> **VRAM 참고**: MF(≈16GB 상주)와 같은 GPU를 쓰므로 SA3는 기본적으로
+> 잡이 끝나면 모델을 내립니다(로드 수십 초가 잡마다 추가). MF를 안 쓰는
+> 시간대라면 `SA3_KEEP_LOADED=1` 환경변수로 상주시켜 더 빠르게 쓸 수 있습니다.
+
+### 프로토콜 (본체 retouch 클라이언트와 계약)
+
+- `GET /health` → `{"status","version":"sa3-v1","cuda","model_loaded","max_audio_s","queue"}`
+- `POST /edit` `{"audio_b64": 44.1kHz wav, "start_s","end_s","prompt"[,"keep_vocals"]}` → `{"job_id"}`
+- `GET /jobs/{id}` → `{"status","phase","progress","elapsed_s"[,"error"]}` (OOM 시 error="cuda_oom")
+- `GET /jobs/{id}/result` → `{"audio_b64","sr"}`
+
 ## 라이선스
 
 코드는 MIT. **Music Flamingo 모델은 NVIDIA OneWay Noncommercial 라이선스**
-(비상업 연구 용도 전용)입니다 — 이 프로젝트는 비상업 개인 프로듀싱 용도로만 쓰세요.
+(비상업 연구 용도 전용), **Stable Audio 3 는 Stability AI Community License**
+(비상업 OK)입니다 — 이 프로젝트는 비상업 개인 프로듀싱 용도로만 쓰세요.

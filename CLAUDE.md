@@ -6,10 +6,20 @@ github.com/EDKPOP/music-production-pipeline — **본체의 `docs/HANDOFF.md`와
 
 ## 역할
 
-자율 송캠프의 **게이트② A&R 청취 심사** 전용 서버. 윈도우 11 + NVIDIA GPU
-(24GB)에서 Music Flamingo 8B를 상주시키고, 맥(본체)이 보낸 오디오를 듣고
-평문 심사평/구조 분석을 돌려준다. 단일 파일 `mf_server.py`, 포트 8400.
-현재 버전 표식: `/health` → `"version": "v6-oomsafe"`.
+자율 송캠프의 GPU 추론 서버 2종을 담는 레포 (윈도우 11 + NVIDIA GPU 24GB):
+
+1. **`mf_server.py` (포트 8400)** — 게이트② A&R 청취 심사. Music Flamingo 8B
+   상주, 맥(본체)이 보낸 오디오의 평문 심사평/구조 분석 반환.
+   버전 표식: `/health` → `"version": "v6-oomsafe"`.
+2. **`sa3_server.py` (포트 8500)** — 트랙 작업실 구간 리터치. 곡 전체 수신 →
+   demucs 보컬/반주 분리 → 반주만 Stable Audio 3 인페인팅(마스크 구간만
+   재생성, 전체를 컨텍스트로) → 마스크 밖 원본 스플라이스 + 보컬 재합성.
+   잡 기반(POST /edit → GET /jobs/{id} 폴링 → /jobs/{id}/result).
+   버전 표식: `"sa3-v1"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
+   **VRAM 공유 주의**: MF 16GB 상주 + SA3 ~6.5GB + demucs — SA3는 기본
+   잡 종료 시 언로드(`SA3_KEEP_LOADED=1` 로 상주 전환). OOM 시 잡
+   error="cuda_oom" (본체가 이 문자열로 안내 분기 — 의미 변경 금지).
+   설치는 README "Stable Audio 3 리터치 서버" 절 (stable-audio-3 uv 환경 공유).
 
 ## 절대 계약 (본체 critic.py가 의존 — 임의 변경 금지)
 
