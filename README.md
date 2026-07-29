@@ -168,7 +168,10 @@ GatedRepoError 로 실패):
 
 ```powershell
 cd $HOME\stable-audio-3
-.venv\Scripts\huggingface-cli.exe login    # 토큰 붙여넣기 (Y/n 은 n 무방)
+# CLI 실행파일 이름은 huggingface_hub 버전에 따라 다릅니다 — 아래 한 줄이 가장 확실
+.venv\Scripts\python.exe -c "from huggingface_hub import login; login()"
+# (토큰 입력 프롬프트가 뜹니다. 구버전이면 .venv\Scripts\hf.exe auth login 또는
+#  .venv\Scripts\huggingface-cli.exe login 도 동작)
 ```
 
 ### 실행
