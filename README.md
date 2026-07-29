@@ -155,6 +155,22 @@ uv pip install --python .venv\Scripts\python.exe --reinstall torch torchaudio --
 > (드라이버가 오래된 경우). requirements-sa3 를 재설치한 뒤에는 항상
 > 4번을 마지막에 한 번 더 — 의존성 해석이 torch를 CPU 빌드로 되돌릴 수 있습니다.
 
+### 모델 접근 승인 (최초 1회 — 게이트 모델)
+
+`stable-audio-3-medium` 은 Hugging Face **게이트 모델**입니다 — 라이선스에
+동의하고 계정 인증을 해야 다운로드됩니다 (안 하면 첫 리터치가 401
+GatedRepoError 로 실패):
+
+1. 브라우저에서 https://huggingface.co/stabilityai/stable-audio-3-medium 접속
+   → HF 계정 로그인 → 라이선스 동의(Agree and access) — 보통 즉시 승인
+2. 토큰 발급: https://huggingface.co/settings/tokens → "Read" 권한 토큰 생성
+3. PowerShell에서 로그인 (토큰은 로컬에 저장 — 서버 재시작 불필요):
+
+```powershell
+cd $HOME\stable-audio-3
+.venv\Scripts\huggingface-cli.exe login    # 토큰 붙여넣기 (Y/n 은 n 무방)
+```
+
 ### 실행
 
 **`run.bat` 더블클릭 한 번이면 MF(8400)와 SA3(8500)가 함께 켜집니다**
