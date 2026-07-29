@@ -145,10 +145,13 @@ python -c "import torch; print('CUDA:', torch.cuda.is_available())"
 
 ### 실행
 
+**`run.bat` 더블클릭 한 번이면 MF(8400)와 SA3(8500)가 함께 켜집니다**
+(SA3 미설치면 안내만 뜨고 MF만 켜짐). 단독 실행:
+
 ```powershell
 cd $HOME\songcamp-mf
 ..\stable-audio-3\.venv\Scripts\Activate.ps1
-python sa3_server.py          # 기본 0.0.0.0:8500  (또는 run_sa3.bat 더블클릭)
+python sa3_server.py          # 기본 0.0.0.0:8500  (또는 run_sa3.bat)
 ```
 
 방화벽 허용 (관리자 PowerShell, 최초 1회):
@@ -160,16 +163,20 @@ New-NetFirewallRule -DisplayName "songcamp-sa3 8500" -Direction Inbound -Protoco
 맥 쪽 설정은 songcamp 웹 UI **⚙️ 설정/상태 탭의 SA3 주소** 칸에
 `http://윈도우IP:8500` 을 넣으면 됩니다. 확인: `curl http://윈도우IP:8500/health`
 
-> **VRAM 참고**: MF(≈16GB 상주)와 같은 GPU를 쓰므로 SA3는 기본적으로
-> 잡이 끝나면 모델을 내립니다(로드 수십 초가 잡마다 추가). MF를 안 쓰는
-> 시간대라면 `SA3_KEEP_LOADED=1` 환경변수로 상주시켜 더 빠르게 쓸 수 있습니다.
+> **VRAM/GPU 중재**: MF(≈16GB)와 SA3(≈6.5GB)는 같은 GPU를 나눠 씁니다.
+> 두 서버 프로세스는 항상 함께 떠 있고, **어느 모델이 VRAM에 올라갈지는
+> 맥이 자동 조율**합니다 — 야간 심사·inbox 처리 전엔 SA3 모델을 내리고 MF를
+> 예열하며, 작업실에서 리터치를 시작하면 MF를 내리고 SA3로 전환합니다.
+> 진행 중인 작업이 있으면 언로드를 거절(409)하므로 잡이 깨질 일은 없습니다.
 
-### 프로토콜 (본체 retouch 클라이언트와 계약)
+### 프로토콜 (본체 retouch 클라이언트·GPU 중재자와 계약)
 
-- `GET /health` → `{"status","version":"sa3-v1","cuda","model_loaded","max_audio_s","queue"}`
+- `GET /health` → `{"status","version":"sa3-v2-arbiter","cuda","model_loaded","busy","max_audio_s","queue"}`
 - `POST /edit` `{"audio_b64": 44.1kHz wav, "start_s","end_s","prompt"[,"keep_vocals"]}` → `{"job_id"}`
 - `GET /jobs/{id}` → `{"status","phase","progress","elapsed_s"[,"error"]}` (OOM 시 error="cuda_oom")
 - `GET /jobs/{id}/result` → `{"audio_b64","sr"}`
+- `POST /unload` → 모델 언로드 (잡 진행/대기 중이면 409 busy) · MF 쪽도 동일하게
+  `POST /load`·`POST /unload` 지원
 
 ## 라이선스
 

@@ -43,10 +43,13 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v1"
+VERSION = "sa3-v2-arbiter"
 SR = 44100
 MAX_AUDIO_S = float(os.environ.get("SA3_MAX_AUDIO_S", 370))  # 모델 상한 380s 아래 안전선
-KEEP_LOADED = os.environ.get("SA3_KEEP_LOADED", "") == "1"
+# 기본은 '상주' — 리터치를 연달아 할 때 매번 로드하지 않는다. GPU가 MF에
+# 필요해지면 맥의 중재자가 POST /unload 로 내린다 (SA3_UNLOAD_EACH=1 이면
+# 과거처럼 잡마다 언로드).
+UNLOAD_EACH = os.environ.get("SA3_UNLOAD_EACH", "") == "1"
 XFADE_S = 0.10           # 마스크 경계 크로스페이드
 RESULT_KEEP = 5          # 메모리에 보관할 완료 잡 수 (결과 wav가 수십 MB)
 
@@ -90,18 +93,25 @@ def _load_sa3():
     return _sa3
 
 
-def _unload():
-    """MF 8B와 24GB GPU를 나눠 쓰므로, 상주 지시가 없으면 잡마다 비운다."""
+def _drop_models():
     global _sa3, _demucs
-    if KEEP_LOADED:
-        return
     _sa3 = _demucs = None
+    import gc
+    gc.collect()
     try:
         import torch
         torch.cuda.empty_cache()
     except Exception:
         pass
-    _log("모델 언로드 (SA3_KEEP_LOADED=1 로 상주 전환 가능)")
+
+
+def _unload():
+    """잡 종료 후 처리 — 기본은 상주(빠른 연속 리터치), SA3_UNLOAD_EACH=1 이면
+    과거처럼 매 잡 언로드. GPU 양보는 맥 중재자의 POST /unload 가 담당한다."""
+    if not UNLOAD_EACH:
+        return
+    _drop_models()
+    _log("모델 언로드 (SA3_UNLOAD_EACH=1)")
 
 
 def _decode_wav(b64: str):
@@ -321,12 +331,30 @@ class EditReq(BaseModel):
     cfg_scale: float = None
 
 
+def _busy() -> bool:
+    return bool(_queue) or any(j["status"] == "running" for j in _jobs.values())
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "version": VERSION, "cuda": _cuda(),
             "model_loaded": _sa3 is not None, "max_audio_s": MAX_AUDIO_S,
+            "busy": _busy(),
             "queue": len(_queue) + sum(1 for j in _jobs.values()
                                        if j["status"] == "running")}
+
+
+@app.post("/unload")
+def unload_model():
+    """모델 언로드 — 야간 심사(MF)에 GPU를 양보할 때 맥 중재자가 호출.
+    리터치 잡이 진행/대기 중이면 409(busy) — 진행 중 잡은 깨뜨리지 않는다."""
+    with _lock:
+        if _busy():
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    _drop_models()
+    _log("모델 언로드 — GPU를 MF(야간 심사)에 양보. 다음 리터치 잡에서 자동 재로드")
+    return {"ok": True, "model_loaded": False}
 
 
 @app.post("/edit")
@@ -375,5 +403,5 @@ if __name__ == "__main__":
     args = ap.parse_args()
     threading.Thread(target=_worker, daemon=True).start()
     _log(f"SA3 리터치 서버 {VERSION} — {args.host}:{args.port} "
-         f"(cuda={_cuda()}, keep_loaded={KEEP_LOADED})")
+         f"(cuda={_cuda()}, unload_each={UNLOAD_EACH} — GPU 양보는 맥 중재자가 /unload 로)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

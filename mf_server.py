@@ -19,6 +19,7 @@ import json
 import re
 import os
 import tempfile
+import threading
 
 import uvicorn
 from fastapi.responses import JSONResponse
@@ -27,6 +28,9 @@ from pydantic import BaseModel
 
 app = FastAPI(title="mf-server", docs_url=None)
 _model = _processor = None
+# GPU 점유 락 — 심사 요청과 /load·/unload가 겹치지 않게. 심사 중 언로드가
+# 들어오면 즉시 409(busy)로 거절한다 (진행 중 잡을 깨뜨리지 않는 것이 계약).
+_gpu_lock = threading.Lock()
 MODEL_ID = "nvidia/music-flamingo-2601-hf"
 MAX_NEW_TOKENS = 448  # 상세 루브릭 (heard A/B/C·첫인상·전개·타깃 청중)
 
@@ -283,11 +287,51 @@ def _enforcer_available() -> bool:
 @app.get("/health")
 def health():
     import torch
-    return {"status": "ok", "version": "v6-oomsafe", "model_loaded": _model is not None,
+    return {"status": "ok", "version": "v7-arbiter", "model_loaded": _model is not None,
             "max_audio_s": MAX_AUDIO_S,
             "cuda": torch.cuda.is_available(),
             "enforcer": _enforcer_available(),   # False면 스키마 불일치가 잦아진다
+            "busy": _gpu_lock.locked(),          # 심사 진행 중 여부 (중재자 참조)
             "device": (str(_model.device) if _model is not None else "unloaded")}
+
+
+@app.post("/load")
+def load_model():
+    """모델 예열 — GPU 중재자(맥)가 야간 심사 시작 전에 호출.
+    이미 로드돼 있으면 no-op. 로딩은 수십 초~1분 (동기)."""
+    if not _gpu_lock.acquire(timeout=2):
+        return JSONResponse(status_code=409, content={"error": "busy"})
+    try:
+        _load()
+        return {"ok": True, "model_loaded": True}
+    finally:
+        _gpu_lock.release()
+
+
+@app.post("/unload")
+def unload_model():
+    """모델 언로드 — 트랙 작업실 리터치(SA3)에 GPU를 양보할 때 맥이 호출.
+    심사 요청이 진행 중이면 409(busy) — 진행 중 잡은 절대 깨뜨리지 않는다.
+    언로드 후에도 심사 요청이 오면 자동으로 다시 로드된다 (정합성 유지)."""
+    global _model, _processor
+    if not _gpu_lock.acquire(timeout=2):
+        return JSONResponse(status_code=409, content={"error": "busy"})
+    try:
+        if _model is None:
+            return {"ok": True, "model_loaded": False}
+        _model = _processor = None
+        import gc
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("모델 언로드 — GPU를 SA3(구간 리터치)에 양보. 다음 심사 요청 시 자동 재로드")
+        return {"ok": True, "model_loaded": False}
+    finally:
+        _gpu_lock.release()
 
 
 MAX_AUDIO_S = int(os.environ.get("MF_MAX_AUDIO_S", "420"))   # 서버 자기방어 상한
@@ -336,6 +380,7 @@ def handle(r: Req):
     import os
     b64s = r.audio_b64s or [b for b in [r.audio_b64, r.audio_b64_b] if b]
     paths = []
+    _gpu_lock.acquire()   # 심사 중 /unload 진입 차단 (unload는 2초 대기 후 409)
     try:
         for b64 in b64s:
             f = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
@@ -362,6 +407,7 @@ def handle(r: Req):
                                              "detail": str(e)[:300]})
             raise
     finally:
+        _gpu_lock.release()
         for p in paths:
             try:
                 os.unlink(p)

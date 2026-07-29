@@ -8,18 +8,27 @@ github.com/EDKPOP/music-production-pipeline — **본체의 `docs/HANDOFF.md`와
 
 자율 송캠프의 GPU 추론 서버 2종을 담는 레포 (윈도우 11 + NVIDIA GPU 24GB):
 
-1. **`mf_server.py` (포트 8400)** — 게이트② A&R 청취 심사. Music Flamingo 8B
-   상주, 맥(본체)이 보낸 오디오의 평문 심사평/구조 분석 반환.
-   버전 표식: `/health` → `"version": "v6-oomsafe"`.
+1. **`mf_server.py` (포트 8400)** — 게이트② A&R 청취 심사. Music Flamingo 8B,
+   맥(본체)이 보낸 오디오의 평문 심사평/구조 분석 반환.
+   버전 표식: `/health` → `"version": "v7-arbiter"`.
 2. **`sa3_server.py` (포트 8500)** — 트랙 작업실 구간 리터치. 곡 전체 수신 →
    demucs 보컬/반주 분리 → 반주만 Stable Audio 3 인페인팅(마스크 구간만
    재생성, 전체를 컨텍스트로) → 마스크 밖 원본 스플라이스 + 보컬 재합성.
    잡 기반(POST /edit → GET /jobs/{id} 폴링 → /jobs/{id}/result).
-   버전 표식: `"sa3-v1"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
-   **VRAM 공유 주의**: MF 16GB 상주 + SA3 ~6.5GB + demucs — SA3는 기본
-   잡 종료 시 언로드(`SA3_KEEP_LOADED=1` 로 상주 전환). OOM 시 잡
-   error="cuda_oom" (본체가 이 문자열로 안내 분기 — 의미 변경 금지).
+   버전 표식: `"sa3-v2-arbiter"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
    설치는 README "Stable Audio 3 리터치 서버" 절 (stable-audio-3 uv 환경 공유).
+
+### GPU 중재 (24GB를 MF 16GB + SA3 6.5GB가 나눠 쓰는 방법)
+
+- `run.bat` 은 **두 서버 프로세스를 함께** 띄운다. VRAM에 어느 '모델'이
+  올라갈지는 **맥의 중재자**(`songcamp/gpu.py`)가 조율한다:
+  야간 심사/inbox 처리 전 → SA3 `POST /unload` 후 MF `POST /load`(예열),
+  작업실 리터치 시작 → MF `POST /unload` (SA3는 잡에서 자동 로드).
+- 양쪽 모두 **작업 진행 중이면 /unload 를 409(busy)로 거절**한다 — 진행 중
+  잡을 깨뜨리지 않는 것이 계약. 언로드된 서버에 요청이 오면 자동 재로드되므로
+  중재 실패는 성능 문제일 뿐 정합성 문제가 아니다.
+- SA3는 기본 상주(연속 리터치 가속), `SA3_UNLOAD_EACH=1` 이면 잡마다 언로드.
+- OOM 시 잡/응답 error="cuda_oom" (본체가 이 문자열로 안내 분기 — 의미 변경 금지).
 
 ## 절대 계약 (본체 critic.py가 의존 — 임의 변경 금지)
 
