@@ -136,11 +136,13 @@ cd stable-audio-3
 uv sync
 
 # 3) 서버 추가 의존성 (같은 환경에 얹기)
-.\.venv\Scripts\Activate.ps1
-pip install -r $HOME\songcamp-mf\requirements-sa3.txt
+#    ⚠ uv가 만든 .venv에는 pip이 없습니다 — 반드시 uv pip에 대상 파이썬을
+#      명시하세요 (activate+pip은 다른 환경의 pip을 잡아 조용히 어긋납니다)
+uv pip install --python .venv\Scripts\python.exe -r $HOME\songcamp-mf\requirements-sa3.txt
 
-# 4) GPU 확인 — True 가 나와야 합니다
-python -c "import torch; print('CUDA:', torch.cuda.is_available())"
+# 4) 확인 — 두 줄 다 통과해야 합니다 (CUDA: True / deps OK)
+.venv\Scripts\python.exe -c "import torch; print('CUDA:', torch.cuda.is_available())"
+.venv\Scripts\python.exe -c "import uvicorn, fastapi, soundfile, demucs; print('deps OK')"
 ```
 
 ### 실행
