@@ -267,6 +267,17 @@ def _run_job(job: dict):
         phase("구간 재생성 (Stable Audio 3)", 0.45)
         gen_inst = _inpaint(inst, start - off, end - off, job["prompt"],
                             job, lambda p: phase(p, 0.5))
+        # 모델/리샘플 반올림으로 생성 길이가 ±수 샘플 어긋난다 — 원본 길이에
+        # 정렬 (초과는 자르고, 부족분은 원본 반주로 채움: 마스크 밖은 어차피
+        # _splice가 원본만 쓴다). 미정렬 시 vocals 합성에서 브로드캐스트 실패.
+        if gen_inst.shape[1] != inst.shape[1]:
+            d = gen_inst.shape[1] - inst.shape[1]
+            _log(f"  생성 길이 보정: {d:+d} 샘플")
+            if d > 0:
+                gen_inst = gen_inst[:, :inst.shape[1]]
+            else:
+                gen_inst = np.concatenate(
+                    [gen_inst, inst[:, gen_inst.shape[1]:]], axis=1)
 
         phase("합성 (원본 스플라이스 + 보컬)", 0.88)
         new_inst = _splice(inst, gen_inst, start - off, end - off)
