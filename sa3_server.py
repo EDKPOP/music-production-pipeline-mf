@@ -166,11 +166,16 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
     dur = inst.shape[1] / SR
     phase(f"구간 재생성 (Stable Audio 3, {start_s:.1f}~{end_s:.1f}s / {dur:.0f}s)")
     kwargs = dict(
-        inpaint_audio=(torch.from_numpy(inst), SR),
+        # 공식 시그니처는 (sample_rate, audio) 순서 — README 예제(torchaudio.load
+        # 반환 순서)와 반대다. 뒤집으면 'int has no attribute to' 로 즉사 (실기 재현)
+        inpaint_audio=(SR, torch.from_numpy(inst)),
         inpaint_mask_start_seconds=float(start_s),
         inpaint_mask_end_seconds=float(end_s),
         prompt=prompt,
         duration=dur,
+        # 기본 sample_size 는 ~120s 상한 — 전곡 컨텍스트가 조용히 잘리지 않게
+        # 곡 길이(+여유)만큼 명시한다 (모델 상한 380s 안쪽)
+        sample_size=int(min(dur + 8.0, 380.0) * SR),
     )
     for k in ("seed", "steps", "cfg_scale"):     # 선택 파라미터 — API가 모르면 제거
         if extra.get(k) is not None:
