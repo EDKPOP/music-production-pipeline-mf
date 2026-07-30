@@ -212,16 +212,19 @@ New-NetFirewallRule -DisplayName "songcamp-sa3 8500" -Direction Inbound -Protoco
 flash-attention 설치 문제**입니다 (medium 의 SAME-L 오토인코더가 flash-attn 필수).
 실측 증상: 생성 구간만 8kHz 이상이 백색잡음처럼 채워짐 (16kbps mp3 같은 인상).
 
-1. 확인 (`/health` 의 `flash_attn` 필드로도 보임 — 서버 시작 로그에도 경고):
-   ```powershell
-   cd $HOME\stable-audio-3
-   uv run python -c "import flash_attn; from flash_attn import flash_attn_func; print(flash_attn.__version__)"
-   ```
-2. 실패하면 [flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels)
-   에서 **CUDA·torch·파이썬 버전이 정확히 맞는** 휠을 받아 `uv pip install <whl>`.
-   (파일명이 스펙: `cu126`=CUDA 12.6, `torch2.7`, `cp310`=Python 3.10)
-3. flash-attn 은 pyproject 에 없으므로 이후 의존성 갱신은 `uv sync --inexact`
-   (그냥 sync 하면 지워짐).
+**자동 복구가 기본입니다** — `run.bat`(또는 `run_sa3.bat`)로 서버가 뜰 때
+flash-attn 이 깨져 있으면 `ensure_flash_attn.py` 가 알아서
+① 환경 태그(파이썬 cpXY · torch x.y · CUDA cuXYZ) 감지 →
+② 휠 저장소들([mjun0812](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+→ [kingbri1](https://github.com/kingbri1/flash-attention) 등)에서 정확히 맞는
+win_amd64 휠 선택 → ③ `pip --no-deps` 설치 → ④ 임포트 재검증까지 합니다.
+결과는 서버 시작 로그와 `/health` 의 `flash_attn` 필드에 보입니다.
+단독 실행: `python ensure_flash_attn.py` (SA3 venv 활성 상태에서).
+
+자동 복구가 "맞는 휠 없음"으로 실패할 때만 수동으로: 위 저장소에서 로그가
+알려준 태그(예: `cp310`·`torch2.7`·`cu128`·`win_amd64`)와 맞는 휠을 받아
+`uv pip install <whl>`. flash-attn 은 pyproject 에 없으므로 이후 의존성
+갱신은 `uv sync --inexact` (그냥 sync 하면 도로 지워짐).
 
 ### 프로토콜 (본체 retouch 클라이언트·GPU 중재자와 계약)
 

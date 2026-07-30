@@ -594,10 +594,20 @@ if __name__ == "__main__":
     threading.Thread(target=_worker, daemon=True).start()
     fa = _flash_attn_status()
     if not fa["ok"]:
-        _log("⚠⚠ flash-attn 임포트 실패 — medium 모델 출력이 '지지직' 글리치가 "
-             f"됩니다! ({fa.get('error')})")
-        _log("   해결: flash-attention-prebuild-wheels 에서 CUDA/torch/파이썬 "
-             "버전이 맞는 휠 설치 후 uv sync --inexact (README Troubleshooting)")
+        # 자동 복구 — 환경 태그 감지 → 맞는 휠 다운로드·설치 → 재검증.
+        # run.bat / run_sa3.bat 어느 쪽으로 떠도 여기를 지나므로 별도 절차 불필요.
+        _log("⚠ flash-attn 임포트 실패 — medium 출력이 '지지직' 글리치가 됩니다. "
+             "자동 복구를 시도합니다…")
+        try:
+            from ensure_flash_attn import ensure
+            if ensure(_log):
+                _FA = None                      # 상태 캐시 리셋 후 재판정
+                fa = _flash_attn_status()
+        except Exception as e:
+            _log(f"자동 복구 실행 오류({type(e).__name__}: {e})")
+    if not fa["ok"]:
+        _log(f"⚠⚠ flash-attn 여전히 불가 ({fa.get('error')}) — README "
+             "'지지직' 트러블슈팅 절의 수동 절차가 필요합니다")
     else:
         _log(f"flash-attn OK (v{fa.get('version')})")
     _log(f"SA3 리터치 서버 {VERSION} — {args.host}:{args.port} "
