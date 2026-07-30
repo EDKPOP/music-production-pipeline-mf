@@ -12,10 +12,11 @@ github.com/EDKPOP/music-production-pipeline — **본체의 `docs/HANDOFF.md`와
    맥(본체)이 보낸 오디오의 평문 심사평/구조 분석 반환.
    버전 표식: `/health` → `"version": "v7-arbiter"`.
 2. **`sa3_server.py` (포트 8500)** — 트랙 작업실 구간 리터치. 곡 전체 수신 →
-   demucs 보컬/반주 분리 → 반주만 Stable Audio 3 인페인팅(마스크 구간만
-   재생성, 전체를 컨텍스트로) → 마스크 밖 원본 스플라이스 + 보컬 재합성.
+   demucs 보컬/반주 분리(또는 클라이언트가 보낸 보컬 스템 재사용 — 체이닝 열화
+   차단) → 반주만 Stable Audio 3 인페인팅(구간 ± 문맥 창, 마스크 구간만 재생성)
+   → 마스크 밖 원본 스플라이스 + 보컬 재합성(보컬 없는 구간은 스템 미합성 게이트).
    잡 기반(POST /edit → GET /jobs/{id} 폴링 → /jobs/{id}/result).
-   버전 표식: `"sa3-v2-arbiter"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
+   버전 표식: `"sa3-v4-stems"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
    설치는 README "Stable Audio 3 리터치 서버" 절 (stable-audio-3 uv 환경 공유).
 
 ### GPU 중재 (24GB를 MF 16GB + SA3 6.5GB가 나눠 쓰는 방법)

@@ -208,10 +208,11 @@ New-NetFirewallRule -DisplayName "songcamp-sa3 8500" -Direction Inbound -Protoco
 
 ### 프로토콜 (본체 retouch 클라이언트·GPU 중재자와 계약)
 
-- `GET /health` → `{"status","version":"sa3-v2-arbiter","cuda","model_loaded","busy","max_audio_s","queue"}`
-- `POST /edit` `{"audio_b64": 44.1kHz wav, "start_s","end_s","prompt"[,"keep_vocals"]}` → `{"job_id"}`
+- `GET /health` → `{"status","version":"sa3-v4-stems","cuda","model_loaded","busy","max_audio_s","queue"}`
+- `POST /edit` `{"audio_b64": 44.1kHz wav, "edits":[{start_s,end_s,prompt,…}]
+  [,"keep_vocals","vocals_b64"(이전 리터치의 보컬 스템 — 있으면 demucs 재분리 생략)]}` → `{"job_id"}`
 - `GET /jobs/{id}` → `{"status","phase","progress","elapsed_s"[,"error"]}` (OOM 시 error="cuda_oom")
-- `GET /jobs/{id}/result` → `{"audio_b64","sr"}`
+- `GET /jobs/{id}/result` → `{"audio_b64","sr"[,"vocals_b64" — 클라이언트가 사이드카 저장, 체이닝 재전송용]}`
 - `POST /unload` → 모델 언로드 (잡 진행/대기 중이면 409 busy) · MF 쪽도 동일하게
   `POST /load`·`POST /unload` 지원
 

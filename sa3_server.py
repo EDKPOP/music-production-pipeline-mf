@@ -19,11 +19,15 @@ HTTP로 위임받아 처리한다. 파이프라인:
   POST /edit            → {"audio_b64": 44.1kHz 스테레오 wav의 b64,
                            "edits": [{"start_s","end_s","prompt"
                                       [,"mode","strength","cfg_scale","fill"]}]
-                           [, "keep_vocals"=true, "seed","steps"]} → {"job_id"}
+                           [, "keep_vocals"=true, "seed","steps",
+                            "vocals_b64": 이전 리터치의 보컬 스템(v4 — 있으면
+                            demucs 재분리 생략, 체이닝 열화 차단)]} → {"job_id"}
                           (구형 단건 start_s/end_s/prompt 도 계속 허용)
   GET  /jobs/{id}       → {"status":"queued|running|done|failed","phase",
                            "progress":0~1,"elapsed_s"[,"error"]}
-  GET  /jobs/{id}/result→ {"audio_b64": 결과 전체 곡 wav b64, "sr":44100}
+  GET  /jobs/{id}/result→ {"audio_b64": 결과 전체 곡 wav b64, "sr":44100
+                           [,"vocals_b64": 보컬 스템 — 클라이언트가 사이드카로
+                            저장해 다음 체이닝에 재전송]}
   OOM 시 잡 error = "cuda_oom" (본체가 이 문자열로 안내 분기)
 
 배치가 기본: 예약 여러 건을 한 잡으로 받아 디코드·보컬 분리를 1회만 하고
@@ -51,9 +55,16 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v3-batch"
+VERSION = "sa3-v4-stems"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
+# inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
+# 인페인팅 평가는 클립의 2~20%만 마스크했고, 장시간 duration 조건은 품질을
+# 떨어뜨린다. 0 이면 과거(v3)처럼 전곡 컨텍스트.
+INPAINT_CTX_S = float(os.environ.get("SA3_INPAINT_CTX_S", 60))
+# 보컬 게이트: 수정 구간의 보컬 에너지가 믹스 대비 이 비율 미만이면(간주 등)
+# 분리 스템(악기 블리드 포함)을 얹지 않는다 — 반주 구간 음질 열화 방지
+VOCAL_MIN_RATIO = 0.05
 NEG_PROMPT = ("low quality, muffled, lo-fi, noisy, distorted, degraded audio, "
               "artifacts, harsh, tinny")
 MAX_AUDIO_S = float(os.environ.get("SA3_MAX_AUDIO_S", 370))  # 모델 상한 380s 아래 안전선
@@ -179,9 +190,10 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
     common = dict(
         prompt=prompt,
         duration=dur,
-        # 기본 sample_size 는 ~120s 상한 — 전곡 컨텍스트가 조용히 잘리지 않게
-        # 곡 길이(+여유)만큼 명시한다 (모델 상한 380s 안쪽)
-        sample_size=int(min(dur + 8.0, 380.0) * SR),
+        # 기본 sample_size 는 ~120s 상한 — 컨텍스트가 조용히 잘리지 않게 명시.
+        # 실제 길이와 정확히 일치시킨다 — 여유 패딩(+8s)은 duration 조건과
+        # 어긋나 후반부가 무너지는 원인이 된다 (ComfyUI #14825 동계열)
+        sample_size=int(min(dur, 380.0) * SR),
         # 문서 기본 cfg_scale=1.0 은 프롬프트를 사실상 무시한다(공식 문서:
         # 강한 준수는 7.0 권장) — 클라이언트가 안 보내면 7.0
         cfg_scale=float(extra.get("cfg_scale") or 7.0),
@@ -321,51 +333,72 @@ def _run_job(job: dict):
             wav = wav[:, a:a + int(MAX_AUDIO_S * SR)]
             _log(f"  곡 {dur:.0f}s > {MAX_AUDIO_S:.0f}s — 윈도우 {off:.1f}s~ 적용")
 
-        # 배치의 핵심: 디코드·분리를 잡당 1회만 하고 구간 생성만 누적한다
-        phase("보컬/반주 분리 (demucs) — 배치당 1회", 0.15)
-        if job.get("keep_vocals", True):
-            vocals, inst = _separate(wav, lambda p: phase(p, 0.22))
-        else:
+        # 배치의 핵심: 디코드·분리를 잡당 1회만 하고 구간 생성만 누적한다.
+        # v4: 클라이언트가 이전 리터치의 보컬 스템(vocals_b64)을 보내면 demucs
+        # 재분리를 생략한다 — 리터치 위에 리터치를 이어갈 때 분리 아티팩트가
+        # 회차마다 누적되는 것(체이닝 열화)이 v3 최대 품질 문제였다.
+        vb64 = job.pop("vocals_b64", None)
+        if not job.get("keep_vocals", True):
             vocals, inst = np.zeros_like(wav), wav
+        elif vb64:
+            phase("보컬 스템 재사용 (이전 리터치의 분리 결과 — 재분리 생략)", 0.2)
+            vocals = _decode_wav(vb64)
+            if off:
+                a0 = int(off * SR)
+                vocals = vocals[:, a0:a0 + wav.shape[1]]
+            if vocals.shape[1] < wav.shape[1]:
+                vocals = np.concatenate(
+                    [vocals, np.zeros((2, wav.shape[1] - vocals.shape[1]),
+                                      np.float32)], axis=1)
+            vocals = np.ascontiguousarray(vocals[:, :wav.shape[1]])
+            inst = wav - vocals
+        else:
+            phase("보컬/반주 분리 (demucs) — 배치당 1회", 0.15)
+            vocals, inst = _separate(wav, lambda p: phase(p, 0.22))
 
         inst_cur = inst.copy()
         total = len(edits)
         for i, e in enumerate(edits):
             f0 = 0.3 + 0.55 * i / total
             s_rel, t_rel = e["start_s"] - off, e["end_s"] - off
-            a, b = int(s_rel * SR), int(t_rel * SR)
             opts = {k: e.get(k) for k in ("mode", "strength", "cfg_scale", "negative")}
             for k in ("seed", "steps"):
                 if job.get(k) is not None:
                     opts[k] = job[k]
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
-            if (e.get("mode") or "inpaint").lower() == "a2a":
-                # 변형(a2a)은 구간±문맥 창만 — 짧은 창일수록 충실도·속도가 좋고,
-                # 창 밖 원본은 어차피 손대지 않는다
-                wa = max(0.0, s_rel - A2A_CTX_S)
-                wb = min(inst_cur.shape[1] / SR, t_rel + A2A_CTX_S)
-                ia, ib = int(wa * SR), int(wb * SR)
-                seg = np.ascontiguousarray(inst_cur[:, ia:ib])
-                gen = _inpaint(seg, s_rel - wa, t_rel - wa, e["prompt"], opts,
-                               lambda p: phase(f"{tagp} · {p}", f0))
-                gen = _align_len(gen, seg)
-                gen = _match_rms(gen, seg, a - ia, b - ia)
-                inst_cur[:, ia:ib] = _splice(seg, gen, s_rel - wa, t_rel - wa)
-            else:
-                gen = _inpaint(inst_cur, s_rel, t_rel, e["prompt"], opts,
-                               lambda p: phase(f"{tagp} · {p}", f0))
-                gen = _align_len(gen, inst_cur)
-                if not e.get("fill"):
-                    gen = _match_rms(gen, inst_cur, a, b)
-                inst_cur = _splice(inst_cur, gen, s_rel, t_rel)
+            # 생성은 항상 '구간 ± 문맥 창'만 — a2a 는 좁게(충실도), inpaint 는
+            # 넓게(앞뒤 흐름). 창 밖은 어차피 손대지 않고, 전곡 생성은 느린 데다
+            # 마스크 비율이 논문 평가 범위(2~20%)를 벗어나 품질이 떨어진다.
+            a2a = (e.get("mode") or "inpaint").lower() == "a2a"
+            ctx = A2A_CTX_S if a2a else INPAINT_CTX_S
+            dur_cur = inst_cur.shape[1] / SR
+            wa = max(0.0, s_rel - ctx) if ctx > 0 else 0.0
+            wb = min(dur_cur, t_rel + ctx) if ctx > 0 else dur_cur
+            ia, ib = int(wa * SR), int(wb * SR)
+            seg = np.ascontiguousarray(inst_cur[:, ia:ib])
+            ra, rb = int((s_rel - wa) * SR), int((t_rel - wa) * SR)
+            gen = _inpaint(seg, s_rel - wa, t_rel - wa, e["prompt"], opts,
+                           lambda p: phase(f"{tagp} · {p}", f0))
+            gen = _align_len(gen, seg)
+            if not e.get("fill"):
+                gen = _match_rms(gen, seg, ra, rb)
+            inst_cur[:, ia:ib] = _splice(seg, gen, s_rel - wa, t_rel - wa)
 
         phase("합성 (원본 스플라이스 + 보컬)", 0.9)
         mixed = inst_cur + vocals
-        # 수정 구간만 mixed — 밖은 분리·재합성조차 거치지 않은 진짜 원본
+        # 수정 구간만 mixed — 밖은 분리·재합성조차 거치지 않은 진짜 원본.
+        # 보컬 게이트: 구간에 보컬이 사실상 없으면 스템(블리드 포함)을 얹지 않는다.
         result_win = wav
         for e in edits:
-            result_win = _splice(result_win, mixed,
-                                 e["start_s"] - off, e["end_s"] - off)
+            s_rel, t_rel = e["start_s"] - off, e["end_s"] - off
+            a, b = int(s_rel * SR), min(int(t_rel * SR), wav.shape[1])
+            v_rms = float(np.sqrt(np.mean(vocals[:, a:b] ** 2))) if b > a else 0.0
+            m_rms = float(np.sqrt(np.mean(wav[:, a:b] ** 2))) if b > a else 0.0
+            layer = mixed
+            if v_rms < max(1e-3, VOCAL_MIN_RATIO * m_rms):
+                layer = inst_cur
+                _log(f"  보컬 게이트: {s_rel:.1f}~{t_rel:.1f}s 보컬 미검출 — 반주만 합성")
+            result_win = _splice(result_win, layer, s_rel, t_rel)
         if off or result_win.shape[1] < full.shape[1]:
             out = full.copy()
             a = int(off * SR)
@@ -379,6 +412,11 @@ def _run_job(job: dict):
 
         phase("인코딩", 0.95)
         job["result_b64"] = _encode_wav(result)
+        # 보컬 스템 동봉 — 클라이언트가 사이드카로 저장해 두면 다음 체이닝
+        # 리터치에서 재분리 없이 재사용한다. 윈도우 크롭이 적용된 긴 곡은
+        # 스템이 전곡을 못 덮으므로 동봉하지 않는다 (오재사용 = 보컬 소실).
+        if job.get("keep_vocals", True) and dur <= MAX_AUDIO_S:
+            job["stem_b64"] = _encode_wav(vocals)
         job["sr"] = SR
         job["status"], job["phase"], job["progress"] = "done", "완료", 1.0
         _log(f"잡 {job['id'][:8]} 완료 — {time.time()-t0:.0f}s, "
@@ -416,10 +454,12 @@ def _worker():
             done = [j for j in _jobs.values() if j["status"] in ("done", "failed")]
             for j in sorted(done, key=lambda x: x["created"])[:-RESULT_KEEP]:
                 j.pop("result_b64", None)
+                j.pop("stem_b64", None)
 
 
 class EditReq(BaseModel):
     audio_b64: str
+    vocals_b64: str = None       # v4: 이전 리터치의 보컬 스템 — 있으면 재분리 생략
     edits: list = None           # [{start_s,end_s,prompt[,mode,strength,cfg_scale,fill,label,negative]}]
     start_s: float = None        # ↓ 구형 단건 호환
     end_s: float = None
@@ -489,6 +529,7 @@ def edit(r: EditReq):
     jid = uuid.uuid4().hex
     job = {"id": jid, "status": "queued", "phase": "대기열", "progress": 0.0,
            "created": time.time(), "audio_b64": r.audio_b64, "edits": edits,
+           "vocals_b64": r.vocals_b64,
            "keep_vocals": r.keep_vocals, "seed": r.seed, "steps": r.steps}
     with _lock:
         _jobs[jid] = job
@@ -517,7 +558,10 @@ def job_result(jid: str):
         raise HTTPException(409, f"잡 상태: {j['status']}")
     if "result_b64" not in j:
         raise HTTPException(410, "결과가 만료되었습니다 — 다시 실행하세요")
-    return {"audio_b64": j["result_b64"], "sr": j["sr"]}
+    out = {"audio_b64": j["result_b64"], "sr": j["sr"]}
+    if j.get("stem_b64"):     # v4: 보컬 스템 — 클라이언트가 체이닝용으로 저장
+        out["vocals_b64"] = j["stem_b64"]
+    return out
 
 
 if __name__ == "__main__":
