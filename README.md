@@ -213,7 +213,10 @@ flash-attention 설치 문제**입니다 (medium 의 SAME-L 오토인코더가 f
 실측 증상: 생성 구간만 8kHz 이상이 백색잡음처럼 채워짐 (16kbps mp3 같은 인상).
 
 **자동 복구가 기본입니다** — `run.bat`(또는 `run_sa3.bat`)로 서버가 뜰 때
-flash-attn 이 깨져 있으면 `ensure_flash_attn.py` 가 알아서
+flash-attn 이 깨져 있거나 **torch 가 CPU 빌드로 바뀌어 있으면**(`uv sync`
+사고의 전형 — 윈도우 PyPI torch 는 CPU 전용이라 cuda=False 가 된다)
+`ensure_flash_attn.py` 가 알아서 ⓪ nvidia-smi 로 드라이버 CUDA 를 읽어
+PyTorch 공식 CUDA 인덱스에서 같은 버전 torch/torchaudio 재설치 후,
 ① 환경 태그(파이썬 cpXY · torch x.y · CUDA cuXYZ) 감지 →
 ② 휠 저장소들([mjun0812](https://github.com/mjun0812/flash-attention-prebuild-wheels)
 → [kingbri1](https://github.com/kingbri1/flash-attention) 등)에서 정확히 맞는

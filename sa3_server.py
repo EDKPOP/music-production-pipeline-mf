@@ -45,6 +45,7 @@ import argparse
 import base64
 import io
 import os
+import sys
 import threading
 import time
 import traceback
@@ -591,18 +592,29 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=8500)
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
-    threading.Thread(target=_worker, daemon=True).start()
+    # 실행 환경 자가 복구 — flash-attn 깨짐('지지직' 글리치)과 uv sync 사고로
+    # torch 가 CPU 빌드가 된 것(cuda=False)을 모두 감지해 자동 설치한다.
+    # run.bat / run_sa3.bat 어느 쪽으로 떠도 여기를 지나므로 별도 절차 불필요.
     fa = _flash_attn_status()
-    if not fa["ok"]:
-        # 자동 복구 — 환경 태그 감지 → 맞는 휠 다운로드·설치 → 재검증.
-        # run.bat / run_sa3.bat 어느 쪽으로 떠도 여기를 지나므로 별도 절차 불필요.
-        _log("⚠ flash-attn 임포트 실패 — medium 출력이 '지지직' 글리치가 됩니다. "
-             "자동 복구를 시도합니다…")
+    if not fa["ok"] or not _cuda():
+        _log(f"⚠ 실행 환경 이상 (flash-attn={'OK' if fa['ok'] else '없음'}, "
+             f"cuda={_cuda()}) — 자동 복구를 시도합니다…")
         try:
             from ensure_flash_attn import ensure
-            if ensure(_log):
+            st = ensure(_log)
+            if st == "restart":
+                _log("환경 복구 설치 완료 — 서버를 자동 재시작합니다")
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception as e:
+                    _log(f"자동 재시작 실패({type(e).__name__}: {e}) — "
+                         "이 창을 닫고 run.bat 을 다시 실행하세요")
+                    raise SystemExit(1)
+            if st:
                 _FA = None                      # 상태 캐시 리셋 후 재판정
                 fa = _flash_attn_status()
+        except SystemExit:
+            raise
         except Exception as e:
             _log(f"자동 복구 실행 오류({type(e).__name__}: {e})")
     if not fa["ok"]:
@@ -610,6 +622,7 @@ if __name__ == "__main__":
              "'지지직' 트러블슈팅 절의 수동 절차가 필요합니다")
     else:
         _log(f"flash-attn OK (v{fa.get('version')})")
+    threading.Thread(target=_worker, daemon=True).start()
     _log(f"SA3 리터치 서버 {VERSION} — {args.host}:{args.port} "
          f"(cuda={_cuda()}, unload_each={UNLOAD_EACH} — GPU 양보는 맥 중재자가 /unload 로)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

@@ -1,17 +1,23 @@
-"""flash-attn 자동 복구 — 감지 → 환경 태그 산출 → 맞는 휠 다운로드·설치 → 재검증.
+"""SA3 실행 환경 자동 복구 — CUDA torch + flash-attn 을 사람 손 없이 되살린다.
 
-medium 모델의 '지지직' 글리치(= flash-attn 미설치/깨짐, 공식 README Troubleshooting)를
-사람 손 없이 고친다. sa3_server.py 가 기동 시 임포트가 깨져 있으면 자동 호출한다.
+medium 모델의 '지지직' 글리치(= flash-attn 미설치/깨짐)와, `uv sync` 사고로
+torch 가 CPU 빌드로 바뀌는 것(윈도우 PyPI torch = CPU 전용)을 모두 복구한다.
+sa3_server.py 가 기동 시 자동 호출한다 — run.bat / run_sa3.bat 어느 쪽이든.
 
-1) 현재 환경의 파이썬(cpXY) · torch(x.y) · CUDA(cuXYZ) · 플랫폼 태그 산출
-2) 후보 릴리스 저장소들의 GitHub API 에서 태그가 정확히 일치하는 휠 검색
-   (정확 일치 우선, 같은 CUDA 메이저는 차선 — 어떤 걸 골랐는지 항상 로그)
-3) pip --no-deps 로 설치 (torch 등 기존 의존성은 절대 건드리지 않음) → 임포트 재검증
+순서:
+1) torch 가 CPU 빌드면: nvidia-smi 로 드라이버 CUDA 확인 → PyTorch 공식
+   CUDA 인덱스(download.pytorch.org/whl/cuXXX)에서 같은 버전 재설치
+2) flash-attn 이 없으면: 파이썬(cpXY)·torch(x.y)·CUDA(cuXYZ) 태그로 휠
+   저장소들에서 정확히 맞는 휠 선택 → pip --no-deps 설치
+3) 뭔가 설치했으면 "restart" 반환 — 서버가 스스로 재시작해 새 환경 적용
+
+torch 정보는 임포트가 아니라 설치 메타데이터에서 읽는다 — 이 프로세스에
+이미 로드된 (구)torch 와 무관하게 정확하다.
 
 실패해도 서버는 뜬다 — 경고와 수동 절차 안내만 남긴다 (조용한 실패 금지).
-주의: `uv sync` 는 자동 실행하지 않는다 — lock 이 torch/CUDA 빌드를 갈아치울 수
-있어 위험하다. 사람이 의존성을 갱신할 때만 `uv sync --inexact` 를 쓸 것
-(--inexact 가 없으면 pyproject 밖의 flash-attn 이 도로 지워진다).
+주의: `uv sync` 는 절대 자동 실행하지 않는다 — lock 이 CUDA torch 를 CPU 로
+갈아치우는 것이 바로 이 사고의 원인이다. 의존성 갱신은 사람이
+`uv sync --inexact` 로만, 그 후 run.bat 이 어긋난 것을 도로 복구한다.
 """
 import json
 import re
@@ -27,15 +33,80 @@ REPOS = [
     "Dao-AILab/flash-attention",      # 공식 (리눅스 위주)
 ]
 
+# PyTorch 공식 휠 인덱스의 CUDA 태그 후보 — 드라이버가 지원하는 최고부터
+CUDA_INDEXES = [130, 129, 128, 126, 124, 121, 118]
+
+
+def _dist_version(name):
+    """설치 메타데이터의 버전 — 임포트 없이, 방금 설치한 것도 정확히 반영."""
+    from importlib import metadata
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _torch_meta():
+    """(기본버전, cu태그) — 예: ("2.7.1", "128") / CPU 빌드면 ("2.7.1", "")."""
+    v = _dist_version("torch")
+    if not v:
+        return None, ""
+    base = v.split("+")[0]
+    cu = v.split("+cu")[1] if "+cu" in v else ""
+    return base, re.sub(r"\D.*$", "", cu)
+
 
 def _tags():
-    import torch
     py = f"cp{sys.version_info[0]}{sys.version_info[1]}"
-    tv = torch.__version__.split("+")[0].split(".")
+    base, cu = _torch_meta()
+    tv = (base or "0.0").split(".")
     torch_tag = f"torch{tv[0]}.{tv[1]}"
-    cu = (torch.version.cuda or "").replace(".", "")      # "12.6" → "126"
     plat = "win_amd64" if sys.platform == "win32" else "linux_x86_64"
     return py, torch_tag, cu, plat
+
+
+def _driver_cuda(log):
+    """nvidia-smi 의 'CUDA Version: 12.8' → 128. GPU/드라이버 미검출 시 None."""
+    try:
+        r = subprocess.run(["nvidia-smi"], capture_output=True, text=True,
+                           timeout=20)
+        m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", r.stdout or "")
+        if m:
+            return int(m.group(1)) * 10 + int(m.group(2))
+    except Exception as e:
+        log(f"  nvidia-smi 실행 불가({type(e).__name__})")
+    return None
+
+
+def _fix_cuda_torch(log):
+    """CPU torch → 같은 버전의 CUDA 빌드로 재설치. 성공 시 True."""
+    base, cu = _torch_meta()
+    if base is None:
+        log("  torch 자체가 설치돼 있지 않습니다 — README 설치 절차 필요")
+        return False
+    drv = _driver_cuda(log)
+    if not drv:
+        log("  NVIDIA 드라이버/GPU 미검출 — CUDA torch 복구 불가")
+        return False
+    ta = _dist_version("torchaudio")
+    log(f"  CPU 빌드 torch v{base} 감지 — CUDA 재설치 시작 "
+        f"(드라이버 CUDA {drv // 10}.{drv % 10}, 수 GB 다운로드라 몇 분 걸립니다)")
+    pins = [f"torch=={base}"] + ([f"torchaudio=={ta.split('+')[0]}"] if ta else
+                                 ["torchaudio"])
+    for exact in (True, False):       # 버전 고정 우선, 전 인덱스 실패 시 최신
+        for cu_idx in CUDA_INDEXES:
+            if cu_idx > drv:
+                continue
+            idx = f"https://download.pytorch.org/whl/cu{cu_idx}"
+            spec = pins if exact else ["torch", "torchaudio"]
+            log(f"  시도: cu{cu_idx} 인덱스, {'버전 고정' if exact else '최신'}")
+            if _run_install(["--index-url", idx] + spec, log, timeout=3600):
+                nb, ncu = _torch_meta()
+                if ncu:
+                    log(f"  ✓ CUDA torch v{nb}+cu{ncu} 재설치 완료")
+                    return True
+    log("  ✗ CUDA torch 재설치 실패 — README 수동 절차 필요")
+    return False
 
 
 def _http_json(url, log):
@@ -97,14 +168,16 @@ def _score(name, py, torch_tag, cu, plat):
     return None
 
 
-def _pip_install(url, log):
+def _run_install(args, log, timeout=1800):
+    """pip → uv pip 순으로 설치 시도. args 는 'install' 뒤에 붙는 인자들."""
     cmds = [
-        [sys.executable, "-m", "pip", "install", "--no-deps", url],
-        ["uv", "pip", "install", "--python", sys.executable, url],
+        [sys.executable, "-m", "pip", "install"] + args,
+        ["uv", "pip", "install", "--python", sys.executable] + args,
     ]
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
             if r.returncode == 0:
                 return True
             log(f"  설치 실패({cmd[0]}): {(r.stderr or r.stdout)[-300:]}")
@@ -125,25 +198,8 @@ def _import_ok():
     return getattr(flash_attn, "__version__", "?")
 
 
-def ensure(log=print) -> bool:
-    """flash-attn 이 동작하면 True. 깨져 있으면 자동 설치 시도 후 결과 반환."""
-    try:
-        v = _import_ok()
-        log(f"flash-attn OK (v{v})")
-        return True
-    except Exception as e:
-        log(f"flash-attn 손상 감지({type(e).__name__}: {e}) — 자동 복구 시작")
-    try:
-        py, torch_tag, cu, plat = _tags()
-    except Exception as e:
-        log(f"  환경 태그 산출 실패({type(e).__name__}) — torch 설치 상태 확인 필요")
-        return False
-    if not cu:
-        log("  CUDA 빌드 torch 가 아닙니다 — flash-attn 휠 복구 불가 (CPU torch?)")
-        return False
-    log(f"  환경 태그: {py} · {torch_tag} · cu{cu} · {plat}")
-
-    best = None                        # (score, fa_version, name, url)
+def _find_fa_wheel(py, torch_tag, cu, plat, log):
+    best = None                        # (score, fa_version, name, url, repo)
     for repo in REPOS:
         try:
             wheels = _release_wheels(repo, log)
@@ -159,26 +215,62 @@ def ensure(log=print) -> bool:
                 best = (s, _fa_version(name), name, url, repo)
         if best and best[0] == 2:      # 정확 일치를 찾았으면 더 안 뒤진다
             break
-    if not best:
-        log("  ✗ 맞는 휠을 찾지 못했습니다 — README 'flash-attn' 절의 수동 절차 필요"
-            f" (필요 태그: {py}·{torch_tag}·cu{cu}·{plat})")
+    return best
+
+
+def ensure(log=print):
+    """환경이 온전하면 True, 복구 설치를 했으면 "restart"(서버 재시작 필요),
+    복구 실패면 False.
+
+    "restart" 인 이유: 이 프로세스엔 이미 (구)torch 가 로드돼 있을 수 있어
+    새로 설치한 CUDA torch/flash-attn 은 프로세스를 새로 띄워야 적용된다.
+    """
+    changed = False
+
+    # ① torch — CPU 빌드(uv sync 사고)면 CUDA 빌드로 재설치
+    base, cu = _torch_meta()
+    if base is None:
+        log("  torch 미설치 — README 설치 절차 필요")
         return False
-    s, _, name, url, repo = best
-    log(f"  휠 선택({repo}{', CUDA 메이저 일치' if s == 1 else ''}): {name}")
-    if not _pip_install(url, log):
-        log("  ✗ 휠 설치 실패 — README 수동 절차를 확인하세요")
-        return False
-    try:
-        v = _import_ok()
-        log(f"  ✓ flash-attn v{v} 복구 완료")
-        log("  (참고: 이후 의존성 갱신은 `uv sync --inexact` — 아니면 도로 지워짐)")
-        return True
-    except Exception as e:
-        log(f"  설치는 됐지만 임포트 실패({type(e).__name__}: {e}) — "
-            "서버 재시작 후 다시 확인하세요")
-        return False
+    if not cu:
+        if not _fix_cuda_torch(log):
+            return False
+        changed = True
+
+    # ② flash-attn — 없거나 깨졌으면 맞는 휠 설치
+    fa_broken = _dist_version("flash-attn") is None
+    if not fa_broken and not changed:
+        try:                           # 설치는 돼 있는데 임포트가 깨진 경우 탐지
+            v = _import_ok()
+            log(f"flash-attn OK (v{v})")
+            return True
+        except Exception as e:
+            log(f"flash-attn 손상 감지({type(e).__name__}: {e}) — 재설치")
+            fa_broken = True
+    if fa_broken:
+        py, torch_tag, cu, plat = _tags()
+        log(f"  flash-attn 휠 탐색 — 환경 태그: {py} · {torch_tag} · cu{cu} · {plat}")
+        best = _find_fa_wheel(py, torch_tag, cu, plat, log)
+        if not best:
+            log("  ✗ 맞는 휠을 찾지 못했습니다 — README 'flash-attn' 절의 수동 "
+                f"절차 필요 (필요 태그: {py}·{torch_tag}·cu{cu}·{plat})")
+            return "restart" if changed else False
+        s, _, name, url, repo = best
+        log(f"  휠 선택({repo}{', CUDA 메이저 일치' if s == 1 else ''}): {name}")
+        if not _run_install(["--no-deps", url], log):
+            log("  ✗ 휠 설치 실패 — README 수동 절차를 확인하세요")
+            return "restart" if changed else False
+        changed = True
+
+    if changed:
+        log("  ✓ 환경 복구 설치 완료 — 새 torch/flash-attn 적용을 위해 재시작 필요")
+        log("  (참고: 이후 의존성 갱신은 `uv sync --inexact` — 그냥 sync 하면 "
+            "CPU torch 로 도로 돌아갑니다)")
+        return "restart"
+    return True
 
 
 if __name__ == "__main__":
-    ok = ensure()
-    sys.exit(0 if ok else 1)
+    st = ensure()
+    print(f"결과: {st}")
+    sys.exit(0 if st else 1)
