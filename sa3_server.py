@@ -316,15 +316,18 @@ def _splice(original: np.ndarray, generated: np.ndarray,
         return out
     out[:, a:b] = gen[:, a:b]
     xf = int(XFADE_S * SR)
-    ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)
+    # 등전력(equal-power) 크로스페이드 — 두 소스의 위상이 어긋난 구간에서
+    # 선형 페이드는 중앙이 움푹 꺼지며 '밀리는' 인상을 만든다 (sin/cos 게인)
+    theta = np.linspace(0.0, np.pi / 2, xf, dtype=np.float32)
+    g_in, g_out = np.sin(theta), np.cos(theta)
     lo = max(a - xf, 0)
     if a - lo > 0:                               # 들어가는 경계
-        r = ramp[-(a - lo):]
-        out[:, lo:a] = original[:, lo:a] * (1 - r) + gen[:, lo:a] * r
+        gi, go = g_in[-(a - lo):], g_out[-(a - lo):]
+        out[:, lo:a] = original[:, lo:a] * go + gen[:, lo:a] * gi
     hi = min(b + xf, n)
     if hi - b > 0:                               # 나오는 경계
-        r = ramp[: hi - b]
-        out[:, b:hi] = gen[:, b:hi] * (1 - r) + original[:, b:hi] * r
+        gi, go = g_in[: hi - b], g_out[: hi - b]
+        out[:, b:hi] = gen[:, b:hi] * go + original[:, b:hi] * gi
     return out
 
 
