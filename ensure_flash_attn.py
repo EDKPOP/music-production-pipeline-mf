@@ -105,11 +105,13 @@ def _fix_cuda_torch(log):
             idx = f"https://download.pytorch.org/whl/cu{cu_idx}"
             spec = pins if exact else ["torch", "torchaudio"]
             log(f"  시도: cu{cu_idx} 인덱스, {'버전 고정' if exact else '최신'}")
-            if _run_install(["--index-url", idx] + spec, log, timeout=3600):
+            if _run_install(["--index-url", idx] + spec, log, timeout=3600,
+                            reinstall=True):
                 nb, ncu = _torch_meta()
                 if ncu:
                     log(f"  ✓ CUDA torch v{nb}+cu{ncu} 재설치 완료")
                     return True
+                log("  설치가 성공을 반환했지만 여전히 CPU 빌드 — 다음 인덱스")
     log("  ✗ CUDA torch 재설치 실패 — README 수동 절차 필요")
     return False
 
@@ -232,20 +234,25 @@ def _uv_path():
 _PIP_BOOTED = False
 
 
-def _run_install(args, log, timeout=3600):
+def _run_install(args, log, timeout=3600, reinstall=False):
     """uv pip → pip 순으로 설치 시도. args 는 'install' 뒤에 붙는 인자들.
 
     uv 가 만든 venv 에는 pip 자체가 없다('No module named pip' 실측) —
     uv 를 우선 쓰고, uv 미발견 시 ensurepip 으로 pip 을 부트스트랩한다.
+    reinstall=True: 같은 버전이 이미 있어도 강제 재설치. CPU torch 2.7.1 은
+    'torch==2.7.1' 요구를 이미 충족해서 이 플래그 없이는 조용한 no-op 이
+    된다(실사고 — 8개 인덱스 전부 성공 반환인데 여전히 CPU).
     """
     global _PIP_BOOTED
     cmds = []
     uv = _uv_path()
     if uv:
-        cmds.append([uv, "pip", "install", "--python", sys.executable] + args)
+        cmds.append([uv, "pip", "install", "--python", sys.executable]
+                    + (["--reinstall"] if reinstall else []) + args)
     else:
         log("  (uv 실행 파일 미발견 — pip 경로로 시도)")
-    cmds.append([sys.executable, "-m", "pip", "install"] + args)
+    cmds.append([sys.executable, "-m", "pip", "install"]
+                + (["--force-reinstall"] if reinstall else []) + args)
     for cmd in cmds:
         tag = os.path.basename(cmd[0])
         try:
