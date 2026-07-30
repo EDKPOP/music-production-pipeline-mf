@@ -428,6 +428,27 @@ if __name__ == "__main__":
     ap.add_argument("--no-preload", action="store_true",
                     help="첫 요청 때 모델 로딩 (기본은 기동 시 미리 로딩)")
     args = ap.parse_args()
+    # 실행 환경 자가 복구 — uv sync 사고로 torch 가 CPU 빌드가 됐으면
+    # CUDA 빌드 재설치 후 자동 재시작 (sa3_server 와 같은 메커니즘 —
+    # 동시 기동 시 파일 락으로 SA3 쪽 설치와 직렬화된다)
+    try:
+        import torch as _t
+        _cuda_ok = _t.cuda.is_available()
+    except Exception:
+        _cuda_ok = False
+    if not _cuda_ok:
+        print("⚠ CUDA torch 가 아닙니다 — 자동 복구를 시도합니다…")
+        try:
+            import sys as _sys
+
+            from ensure_flash_attn import ensure_cuda_torch
+            if ensure_cuda_torch(print) == "restart":
+                print("환경 복구 완료 — 서버를 자동 재시작합니다")
+                os.execv(_sys.executable, [_sys.executable] + _sys.argv)
+        except SystemExit:
+            raise
+        except Exception as _e:
+            print(f"자동 복구 실행 오류({type(_e).__name__}: {_e}) — CPU로 계속")
     if not args.no_preload:
         _load()
     print(f"mf-server 대기 중 — http://{args.host}:{args.port}  (헬스체크: /health)")

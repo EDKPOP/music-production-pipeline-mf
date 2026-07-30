@@ -226,8 +226,12 @@ win_amd64 휠 선택 → ③ `pip --no-deps` 설치 → ④ 임포트 재검증�
 
 자동 복구가 "맞는 휠 없음"으로 실패할 때만 수동으로: 위 저장소에서 로그가
 알려준 태그(예: `cp310`·`torch2.7`·`cu128`·`win_amd64`)와 맞는 휠을 받아
-`uv pip install <whl>`. flash-attn 은 pyproject 에 없으므로 이후 의존성
-갱신은 `uv sync --inexact` (그냥 sync 하면 도로 지워짐).
+`uv pip install --python .venv\Scripts\python.exe <whl>`.
+
+> ⚠ **설치가 끝난 뒤에는 이 두 venv(`songcamp-mf\.venv`, `stable-audio-3\.venv`)
+> 에서 `uv sync` 를 실행하지 마세요 — `--inexact` 를 붙여도 lock 에 있는
+> torch 를 PyPI CPU 빌드로 되돌립니다 (2026-07-30 실사고: cuda=False 로
+> MF·SA3 둘 다 CPU가 됨). 틀어져도 run.bat 재시작이 자동 복구합니다.
 
 ### 프로토콜 (본체 retouch 클라이언트·GPU 중재자와 계약)
 

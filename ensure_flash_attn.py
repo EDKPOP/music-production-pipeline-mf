@@ -15,15 +15,20 @@ torch 정보는 임포트가 아니라 설치 메타데이터에서 읽는다 �
 이미 로드된 (구)torch 와 무관하게 정확하다.
 
 실패해도 서버는 뜬다 — 경고와 수동 절차 안내만 남긴다 (조용한 실패 금지).
-주의: `uv sync` 는 절대 자동 실행하지 않는다 — lock 이 CUDA torch 를 CPU 로
-갈아치우는 것이 바로 이 사고의 원인이다. 의존성 갱신은 사람이
-`uv sync --inexact` 로만, 그 후 run.bat 이 어긋난 것을 도로 복구한다.
+MF(8400)·SA3(8500)가 run.bat 으로 동시에 떠도 파일 락으로 설치를 직렬화한다.
+주의: 이 venv 들에서 `uv sync` 는 (--inexact 포함) 실행 금지 — lock 이 CUDA
+torch 를 PyPI CPU 빌드로 갈아치운다(실사고). 틀어지면 run.bat 이 복구한다.
 """
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
+from contextlib import contextmanager
 
 # 순서 = 신뢰 순. mjun0812 은 리눅스 중심이지만 릴리스에 win_amd64 가 섞이면 잡힌다.
 REPOS = [
@@ -168,23 +173,107 @@ def _score(name, py, torch_tag, cu, plat):
     return None
 
 
-def _run_install(args, log, timeout=1800):
-    """pip → uv pip 순으로 설치 시도. args 는 'install' 뒤에 붙는 인자들."""
-    cmds = [
-        [sys.executable, "-m", "pip", "install"] + args,
-        ["uv", "pip", "install", "--python", sys.executable] + args,
-    ]
+@contextmanager
+def _repair_lock(log):
+    """복구 설치 직렬화 — run.bat 이 MF(8400)·SA3(8500)를 동시에 띄우면
+    두 서버가 같이 복구에 진입할 수 있다. venv 는 서로 달라도 수 GB 다운로드와
+    uv 캐시 접근이 겹치므로 파일 락으로 한 번에 하나만 설치하게 한다."""
+    path = os.path.join(tempfile.gettempdir(), "songcamp_env_repair.lock")
+    t0, fd, waited = time.time(), None, False
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            break
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue                      # 방금 해제됨 — 재시도
+            if age > 7200:                    # 죽은 프로세스의 잔재 락
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            if not waited:
+                waited = True
+                log("  다른 서버가 환경 복구 설치 중 — 끝날 때까지 대기…")
+            time.sleep(5)
+            if time.time() - t0 > 7200:
+                raise RuntimeError("환경 복구 락 대기 2시간 초과")
+    try:
+        if waited:
+            log("  대기 종료 — 이 서버의 복구 진행")
+        yield
+    finally:
+        try:
+            os.close(fd)
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _uv_path():
+    """uv 실행 파일 — PATH 에 없어도 표준 설치 위치를 뒤진다."""
+    p = shutil.which("uv")
+    if p:
+        return p
+    home = os.path.expanduser("~")
+    for c in (os.path.join(home, ".local", "bin", "uv.exe"),
+              os.path.join(home, ".cargo", "bin", "uv.exe"),
+              os.path.join(home, ".local", "bin", "uv"),
+              os.path.join(home, ".cargo", "bin", "uv")):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+_PIP_BOOTED = False
+
+
+def _run_install(args, log, timeout=3600):
+    """uv pip → pip 순으로 설치 시도. args 는 'install' 뒤에 붙는 인자들.
+
+    uv 가 만든 venv 에는 pip 자체가 없다('No module named pip' 실측) —
+    uv 를 우선 쓰고, uv 미발견 시 ensurepip 으로 pip 을 부트스트랩한다.
+    """
+    global _PIP_BOOTED
+    cmds = []
+    uv = _uv_path()
+    if uv:
+        cmds.append([uv, "pip", "install", "--python", sys.executable] + args)
+    else:
+        log("  (uv 실행 파일 미발견 — pip 경로로 시도)")
+    cmds.append([sys.executable, "-m", "pip", "install"] + args)
     for cmd in cmds:
+        tag = os.path.basename(cmd[0])
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=timeout)
+            err = (r.stderr or r.stdout or "")
             if r.returncode == 0:
                 return True
-            log(f"  설치 실패({cmd[0]}): {(r.stderr or r.stdout)[-300:]}")
+            if ("No module named pip" in err and not _PIP_BOOTED
+                    and cmd[0] == sys.executable):
+                _PIP_BOOTED = True     # uv venv 표준 상태 — pip 1회 부트스트랩
+                log("  venv 에 pip 없음 — ensurepip 부트스트랩")
+                b = subprocess.run([sys.executable, "-m", "ensurepip",
+                                    "--upgrade"], capture_output=True,
+                                   text=True, timeout=600)
+                if b.returncode == 0:
+                    r = subprocess.run(cmd, capture_output=True, text=True,
+                                       timeout=timeout)
+                    if r.returncode == 0:
+                        return True
+                    err = (r.stderr or r.stdout or "")
+                else:
+                    log(f"  ensurepip 실패: {(b.stderr or b.stdout or '')[-200:]}")
+            log(f"  설치 실패({tag}): {err[-300:]}")
         except FileNotFoundError:
-            continue
+            log(f"  ({tag} 실행 파일 없음 — 다음 방법)")
         except Exception as e:
-            log(f"  설치 오류({cmd[0]}): {type(e).__name__}: {e}")
+            log(f"  설치 오류({tag}): {type(e).__name__}: {e}")
     return False
 
 
@@ -218,6 +307,21 @@ def _find_fa_wheel(py, torch_tag, cu, plat, log):
     return best
 
 
+def ensure_cuda_torch(log=print):
+    """torch 만 검사·복구 (MF 서버용 — flash-attn 불필요).
+    True=온전 | "restart"=복구 설치함(재시작 필요) | False=복구 실패."""
+    base, cu = _torch_meta()
+    if base is None:
+        log("  torch 미설치 — README 설치 절차 필요")
+        return False
+    if cu:
+        return True
+    with _repair_lock(log):
+        if _torch_meta()[1]:           # 락 대기 중 다른 경로로 복구됐을 수도
+            return "restart"
+        return "restart" if _fix_cuda_torch(log) else False
+
+
 def ensure(log=print):
     """환경이 온전하면 True, 복구 설치를 했으면 "restart"(서버 재시작 필요),
     복구 실패면 False.
@@ -225,21 +329,13 @@ def ensure(log=print):
     "restart" 인 이유: 이 프로세스엔 이미 (구)torch 가 로드돼 있을 수 있어
     새로 설치한 CUDA torch/flash-attn 은 프로세스를 새로 띄워야 적용된다.
     """
-    changed = False
-
-    # ① torch — CPU 빌드(uv sync 사고)면 CUDA 빌드로 재설치
+    # 빠른 판정 — 둘 다 온전하면 락 없이 즉시 종료
     base, cu = _torch_meta()
     if base is None:
         log("  torch 미설치 — README 설치 절차 필요")
         return False
-    if not cu:
-        if not _fix_cuda_torch(log):
-            return False
-        changed = True
-
-    # ② flash-attn — 없거나 깨졌으면 맞는 휠 설치
     fa_broken = _dist_version("flash-attn") is None
-    if not fa_broken and not changed:
+    if cu and not fa_broken:
         try:                           # 설치는 돼 있는데 임포트가 깨진 경우 탐지
             v = _import_ok()
             log(f"flash-attn OK (v{v})")
@@ -247,25 +343,34 @@ def ensure(log=print):
         except Exception as e:
             log(f"flash-attn 손상 감지({type(e).__name__}: {e}) — 재설치")
             fa_broken = True
-    if fa_broken:
-        py, torch_tag, cu, plat = _tags()
-        log(f"  flash-attn 휠 탐색 — 환경 태그: {py} · {torch_tag} · cu{cu} · {plat}")
-        best = _find_fa_wheel(py, torch_tag, cu, plat, log)
-        if not best:
-            log("  ✗ 맞는 휠을 찾지 못했습니다 — README 'flash-attn' 절의 수동 "
-                f"절차 필요 (필요 태그: {py}·{torch_tag}·cu{cu}·{plat})")
-            return "restart" if changed else False
-        s, _, name, url, repo = best
-        log(f"  휠 선택({repo}{', CUDA 메이저 일치' if s == 1 else ''}): {name}")
-        if not _run_install(["--no-deps", url], log):
-            log("  ✗ 휠 설치 실패 — README 수동 절차를 확인하세요")
-            return "restart" if changed else False
-        changed = True
+
+    with _repair_lock(log):
+        changed = False
+        # ① torch — CPU 빌드(uv sync 사고)면 CUDA 빌드로 재설치
+        if not _torch_meta()[1]:
+            if not _fix_cuda_torch(log):
+                return False
+            changed = True
+        # ② flash-attn — 없거나 깨졌으면 맞는 휠 설치
+        if fa_broken or _dist_version("flash-attn") is None:
+            py, torch_tag, cu, plat = _tags()
+            log(f"  flash-attn 휠 탐색 — 환경 태그: {py} · {torch_tag} · cu{cu} · {plat}")
+            best = _find_fa_wheel(py, torch_tag, cu, plat, log)
+            if not best:
+                log("  ✗ 맞는 휠을 찾지 못했습니다 — README 'flash-attn' 절의 수동 "
+                    f"절차 필요 (필요 태그: {py}·{torch_tag}·cu{cu}·{plat})")
+                return "restart" if changed else False
+            s, _, name, url, repo = best
+            log(f"  휠 선택({repo}{', CUDA 메이저 일치' if s == 1 else ''}): {name}")
+            if not _run_install(["--no-deps", url], log):
+                log("  ✗ 휠 설치 실패 — README 수동 절차를 확인하세요")
+                return "restart" if changed else False
+            changed = True
 
     if changed:
         log("  ✓ 환경 복구 설치 완료 — 새 torch/flash-attn 적용을 위해 재시작 필요")
-        log("  (참고: 이후 의존성 갱신은 `uv sync --inexact` — 그냥 sync 하면 "
-            "CPU torch 로 도로 돌아갑니다)")
+        log("  ⚠ 이 venv 들에서 `uv sync` 는 절대 실행하지 마세요 — lock 이 "
+            "torch 를 CPU 빌드로 되돌립니다 (이번 사고의 원인)")
         return "restart"
     return True
 
