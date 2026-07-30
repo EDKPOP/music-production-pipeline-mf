@@ -521,6 +521,80 @@ def unload_model():
     return {"ok": True, "model_loaded": False}
 
 
+@app.post("/diag")
+def diag():
+    """원격 진단 — 최소 생성부터 인자를 하나씩 얹어 어느 단계가 소리를
+    망가뜨리는지 가른다 (맥에서 호출·분석). busy 면 409."""
+    with _lock:
+        if _busy():
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    import inspect
+
+    import torch
+    model = _load_sa3()
+    try:
+        sig = str(inspect.signature(model.generate))
+    except Exception as e:
+        sig = f"(조회 불가: {e})"
+    try:
+        import stable_audio_3 as _sa
+        pkg_ver = getattr(_sa, "__version__", "?")
+    except Exception:
+        pkg_ver = "?"
+    info = {"generate_signature": sig[:2000], "package_version": pkg_ver,
+            "torch": torch.__version__, "model_class": type(model).__name__,
+            "flash_attn": _flash_attn_status()}
+
+    def to_np(out):
+        if isinstance(out, tuple):
+            out = out[0]
+        if hasattr(out, "cpu"):
+            out = out.float().cpu().numpy()
+        out = np.asarray(out, dtype=np.float32)
+        if out.ndim == 3:
+            out = out[0]
+        if out.ndim == 1:
+            out = np.stack([out, out])
+        return out
+
+    prompt = "upbeat instrumental K-pop dance, 130 BPM, four-on-the-floor kick, bright synth"
+    t = np.linspace(0, 10, 10 * SR, dtype=np.float32)
+    music_like = (0.3 * np.sin(2 * np.pi * 220 * t)
+                  * (0.5 + 0.5 * np.sign(np.sin(2 * np.pi * 2.1666 * t))))
+    seg = np.stack([music_like, music_like])
+    cases = {
+        "bare": dict(prompt=prompt, duration=10),
+        "steps50": dict(prompt=prompt, duration=10, steps=50),
+        "kw_sample_size": dict(prompt=prompt, duration=10,
+                               sample_size=int(10 * SR)),
+        "kw_cfg_neg": dict(prompt=prompt, duration=10, cfg_scale=7.0,
+                           negative_prompt=NEG_PROMPT),
+        "a2a_low": dict(prompt=prompt, duration=10,
+                        init_audio=(SR, torch.from_numpy(seg)),
+                        init_noise_level=0.1),
+        "inpaint_mid": dict(prompt=prompt, duration=10,
+                            inpaint_audio=(SR, torch.from_numpy(seg)),
+                            inpaint_mask_start_seconds=4.0,
+                            inpaint_mask_end_seconds=6.0),
+    }
+    results = {}
+    for name, kwargs in cases.items():
+        t0 = time.time()
+        try:
+            out = to_np(model.generate(**kwargs))
+            results[name] = {"ok": True, "elapsed_s": round(time.time() - t0, 2),
+                             "shape": list(out.shape),
+                             "audio_b64": _encode_wav(out)}
+            _log(f"diag {name}: OK {out.shape} {results[name]['elapsed_s']}s")
+        except Exception as e:
+            results[name] = {"ok": False,
+                             "error": f"{type(e).__name__}: {str(e)[:300]}"}
+            _log(f"diag {name}: 실패 {results[name]['error']}")
+    _unload()
+    return {"info": info, "results": results}
+
+
 @app.post("/edit")
 def edit(r: EditReq):
     if r.edits:
