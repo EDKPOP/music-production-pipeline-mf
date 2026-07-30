@@ -206,6 +206,23 @@ New-NetFirewallRule -DisplayName "songcamp-sa3 8500" -Direction Inbound -Protoco
 > 예열하며, 작업실에서 리터치를 시작하면 MF를 내리고 SA3로 전환합니다.
 > 진행 중인 작업이 있으면 언로드를 거절(409)하므로 잡이 깨질 일은 없습니다.
 
+### ⚠ 출력이 '지지직'/초저음질 해시로 들릴 때 (medium 전용 — flash-attn)
+
+공식 README Troubleshooting: **"Output audio is a static glitch sound" =
+flash-attention 설치 문제**입니다 (medium 의 SAME-L 오토인코더가 flash-attn 필수).
+실측 증상: 생성 구간만 8kHz 이상이 백색잡음처럼 채워짐 (16kbps mp3 같은 인상).
+
+1. 확인 (`/health` 의 `flash_attn` 필드로도 보임 — 서버 시작 로그에도 경고):
+   ```powershell
+   cd $HOME\stable-audio-3
+   uv run python -c "import flash_attn; from flash_attn import flash_attn_func; print(flash_attn.__version__)"
+   ```
+2. 실패하면 [flash-attention-prebuild-wheels](https://github.com/mjun0812/flash-attention-prebuild-wheels)
+   에서 **CUDA·torch·파이썬 버전이 정확히 맞는** 휠을 받아 `uv pip install <whl>`.
+   (파일명이 스펙: `cu126`=CUDA 12.6, `torch2.7`, `cp310`=Python 3.10)
+3. flash-attn 은 pyproject 에 없으므로 이후 의존성 갱신은 `uv sync --inexact`
+   (그냥 sync 하면 지워짐).
+
 ### 프로토콜 (본체 retouch 클라이언트·GPU 중재자와 계약)
 
 - `GET /health` → `{"status","version":"sa3-v4-stems","cuda","model_loaded","busy","max_audio_s","queue"}`

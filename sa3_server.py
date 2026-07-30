@@ -95,6 +95,25 @@ def _cuda():
         return False
 
 
+_FA = None
+
+
+def _flash_attn_status() -> dict:
+    """flash-attn 동작 여부 — medium 모델은 SAME-L 오토인코더가 flash-attn 을
+    요구하며, 깨져 있으면 출력 전체가 '지지직' 글리치가 된다 (공식 README
+    Troubleshooting: 'static glitch sound = flash-attention 설치 문제').
+    실측 증상: 생성 구간 8kHz+ 스펙트럼 평탄도 0.003→0.2 (백색잡음성 해시)."""
+    global _FA
+    if _FA is None:
+        try:
+            import flash_attn
+            from flash_attn import flash_attn_func  # noqa: F401 — 실기능 임포트 검증
+            _FA = {"ok": True, "version": getattr(flash_attn, "__version__", "?")}
+        except Exception as e:
+            _FA = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    return _FA
+
+
 def _load_demucs():
     global _demucs
     if _demucs is None:
@@ -478,9 +497,12 @@ def _busy() -> bool:
 
 @app.get("/health")
 def health():
+    fa = _flash_attn_status()
     return {"status": "ok", "version": VERSION, "cuda": _cuda(),
             "model_loaded": _sa3 is not None, "max_audio_s": MAX_AUDIO_S,
             "busy": _busy(),
+            "flash_attn": fa["ok"],
+            "flash_attn_info": fa.get("version") or fa.get("error", ""),
             "queue": len(_queue) + sum(1 for j in _jobs.values()
                                        if j["status"] == "running")}
 
@@ -570,6 +592,14 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
     threading.Thread(target=_worker, daemon=True).start()
+    fa = _flash_attn_status()
+    if not fa["ok"]:
+        _log("⚠⚠ flash-attn 임포트 실패 — medium 모델 출력이 '지지직' 글리치가 "
+             f"됩니다! ({fa.get('error')})")
+        _log("   해결: flash-attention-prebuild-wheels 에서 CUDA/torch/파이썬 "
+             "버전이 맞는 휠 설치 후 uv sync --inexact (README Troubleshooting)")
+    else:
+        _log(f"flash-attn OK (v{fa.get('version')})")
     _log(f"SA3 리터치 서버 {VERSION} — {args.host}:{args.port} "
          f"(cuda={_cuda()}, unload_each={UNLOAD_EACH} — GPU 양보는 맥 중재자가 /unload 로)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
