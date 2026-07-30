@@ -33,8 +33,9 @@ HTTP로 위임받아 처리한다. 파이프라인:
 배치가 기본: 예약 여러 건을 한 잡으로 받아 디코드·보컬 분리를 1회만 하고
 반주 위에 구간별 생성(inpaint=전곡 컨텍스트 재생성 / a2a=구간±문맥 창을
 원본 초기값으로 변형)을 누적한 뒤, 마지막에 원본과 1회 합성한다.
-생성 구간은 원본 구간과 RMS 매칭(음량 꺼짐 방지), negative prompt 로
-음질 저하 어휘를 기본 차단한다.
+생성 구간은 원본 구간과 RMS 매칭(음량 꺼짐 방지). cfg 는 기본 2.0·상한
+4.5 — cfg 7 + negative 조합이 마스크 구간을 백색잡음으로 만든 실사고의
+재발 방지 (negative 는 명시 요청 시에만 전달).
 
 GPU 메모리: 이 PC는 MF 8B(~16GB)가 상주하므로 SA3(~6.5GB)+demucs는
 기본적으로 잡이 끝나면 언로드한다 (SA3_KEEP_LOADED=1 로 상주 전환).
@@ -56,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4-stems"
+VERSION = "sa3-v4.1-guidance"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -214,12 +215,19 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         # 실제 길이와 정확히 일치시킨다 — 여유 패딩(+8s)은 duration 조건과
         # 어긋나 후반부가 무너지는 원인이 된다 (ComfyUI #14825 동계열)
         sample_size=int(min(dur, 380.0) * SR),
-        # 문서 기본 cfg_scale=1.0 은 프롬프트를 사실상 무시한다(공식 문서:
-        # 강한 준수는 7.0 권장) — 클라이언트가 안 보내면 7.0
-        cfg_scale=float(extra.get("cfg_scale") or 7.0),
-        # 음질 저하 어휘 차단 (공식 문서의 negative_prompt)
-        negative_prompt=str(extra.get("negative") or NEG_PROMPT),
+        # ⚠ 실측 확정(2026-07-30, /diag): 이 post-trained 체크포인트(8스텝
+        # 핑퐁, 기본 cfg 1.0)에 cfg 7 + negative 를 얹으면 마스크 구간이
+        # 백색잡음이 된다 (>10kHz 비중 79%, '16kbps 저음질' 증상의 진범).
+        # cfg 1~4 는 실측 정상(0.5~3%) — 기본 2.0, 상한 4.5 로 강제.
+        cfg_scale=min(max(float(extra.get("cfg_scale") or 2.0), 1.0), 4.5),
     )
+    # negative_prompt 는 기본 미사용 — cfg 와 결합해 품질 붕괴를 일으킨
+    # 당사자다. 클라이언트가 명시로 보낼 때만 전달.
+    neg = str(extra.get("negative") or "").strip()
+    if neg:
+        common["negative_prompt"] = neg
+    if extra.get("apg_scale") is not None:   # APG(대안 유도) 실험용 패스스루
+        common["apg_scale"] = float(extra["apg_scale"])
     if mode == "a2a":
         # audio-to-audio: 원본 반주를 초기값으로 깔고 노이즈를 부분만 섞어
         # 뼈대(멜로디·리듬)를 유지한 채 변형. 창 전체가 다시 그려지지만
@@ -381,7 +389,8 @@ def _run_job(job: dict):
         for i, e in enumerate(edits):
             f0 = 0.3 + 0.55 * i / total
             s_rel, t_rel = e["start_s"] - off, e["end_s"] - off
-            opts = {k: e.get(k) for k in ("mode", "strength", "cfg_scale", "negative")}
+            opts = {k: e.get(k) for k in ("mode", "strength", "cfg_scale",
+                                          "negative", "apg_scale")}
             for k in ("seed", "steps"):
                 if job.get(k) is not None:
                     opts[k] = job[k]
@@ -611,6 +620,7 @@ def edit(r: EditReq):
                     "fill": bool(e.get("fill")),
                     "label": str(e.get("label") or ""),
                     "negative": e.get("negative"),
+                    "apg_scale": e.get("apg_scale"),
                 })
             except (TypeError, ValueError):
                 raise HTTPException(400, "edits 형식 오류 — start_s/end_s/prompt 필수")
