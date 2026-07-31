@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.3-apg"
+VERSION = "sa3-v4.4-overlay"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -231,7 +231,12 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         common["negative_prompt"] = neg
     if extra.get("apg_scale") is not None:   # APG — 노이즈 없는 준수 강화 (실측)
         common["apg_scale"] = min(max(float(extra["apg_scale"]), 1.0), 10.0)
-    if mode == "a2a":
+    if mode == "t2a":
+        # 순수 생성 — overlay 모드용: 마스크 길이만큼 '요청한 요소만' 만든다
+        # (init/inpaint 조건 없음 — 프롬프트가 곧 결과)
+        phase(f"요소 생성 (t2a, {dur:.1f}s)")
+        kwargs = dict(**common)
+    elif mode == "a2a":
         # audio-to-audio: 원본 반주를 초기값으로 깔고 노이즈를 부분만 섞어
         # 뼈대(멜로디·리듬)를 유지한 채 변형. 창 전체가 다시 그려지지만
         # 마스크 밖은 이후 _splice 가 진짜 원본으로 되돌린다.
@@ -442,10 +447,36 @@ def _run_job(job: dict):
                 if job.get(k) is not None:
                     opts[k] = job[k]
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
+            mode_e = (e.get("mode") or "inpaint").lower()
+            if mode_e == "overlay":
+                # overlay — 원본은 1샘플도 안 바꾸고, 요청한 요소만 t2a로
+                # 따로 생성해 구간 위에 '얹는다'. "추가해줘" 지시에서 다른
+                # 소리가 바뀌어버리는 a2a 의 구조적 한계를 우회하는 모드.
+                a, b = int(s_rel * SR), min(int(t_rel * SR), inst_cur.shape[1])
+                seg0 = np.zeros((2, b - a), dtype=np.float32)
+                opts2 = dict(opts)
+                opts2["mode"] = "t2a"
+                gen = _inpaint(seg0, 0.0, 0.0, e["prompt"], opts2,
+                               lambda p: phase(f"{tagp} · {p}", f0))
+                gen = _align_len(gen, seg0)
+                ref = inst_cur[:, a:b]
+                ref_rms = float(np.sqrt(np.mean(ref ** 2))) or 1e-4
+                g_rms = float(np.sqrt(np.mean(gen ** 2))) or 1e-4
+                # strength = 얹는 크기: 0.25 은은 · 0.4 또렷 · 0.55 전면
+                lvl = min(max(float(e.get("strength") or 0.4), 0.15), 0.9)
+                gen *= (ref_rms / g_rms) * lvl * 1.6
+                xf0 = int(0.03 * SR)
+                if gen.shape[1] > 2 * xf0:      # 요소 양끝 페이드 (클릭 방지)
+                    r0 = np.linspace(0.0, 1.0, xf0, dtype=np.float32)
+                    gen[:, :xf0] *= r0
+                    gen[:, -xf0:] *= r0[::-1]
+                inst_cur[:, a:b] = inst_cur[:, a:b] + gen
+                _log(f"  overlay: 요소 RMS ×{lvl * 1.6:.2f} (원본 무변경, 위에 합성)")
+                continue
             # 생성은 항상 '구간 ± 문맥 창'만 — a2a 는 좁게(충실도), inpaint 는
             # 넓게(앞뒤 흐름). 창 밖은 어차피 손대지 않고, 전곡 생성은 느린 데다
             # 마스크 비율이 논문 평가 범위(2~20%)를 벗어나 품질이 떨어진다.
-            a2a = (e.get("mode") or "inpaint").lower() == "a2a"
+            a2a = mode_e == "a2a"
             ctx = A2A_CTX_S if a2a else INPAINT_CTX_S
             dur_cur = inst_cur.shape[1] / SR
             wa = max(0.0, s_rel - ctx) if ctx > 0 else 0.0
@@ -561,6 +592,7 @@ def health():
     return {"status": "ok", "version": VERSION, "cuda": _cuda(),
             "model_loaded": _sa3 is not None, "max_audio_s": MAX_AUDIO_S,
             "busy": _busy(),
+            "modes": ["inpaint", "a2a", "overlay"],   # 클라이언트 기능 게이트
             "flash_attn": fa["ok"],
             "flash_attn_info": fa.get("version") or fa.get("error", ""),
             "queue": len(_queue) + sum(1 for j in _jobs.values()
