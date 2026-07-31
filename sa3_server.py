@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.4-overlay"
+VERSION = "sa3-v4.5-ctx-overlay"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -338,6 +338,31 @@ def _phase_align(gen: np.ndarray, ref: np.ndarray, a: int, b: int):
     return out, lag
 
 
+def _spectral_new(gen: np.ndarray, orig: np.ndarray) -> np.ndarray:
+    """생성물에서 '원본에 없던 성분'만 추출 — overlay 의 핵심.
+
+    |G|−|O| 를 정류(음수=0)한 크기에 생성물의 위상을 입혀 복원한다.
+    원본이 이미 갖고 있던 에너지 대역은 차감되어 사라지고, 모델이 새로
+    추가한 소리(필인·레이어)만 남는다 — 문맥 조건(inpaint) 생성이라
+    곡의 팔레트·그루브를 물려받은 상태의 '추가분'이다."""
+    import torch
+    n_fft, hop = 2048, 512
+    win = torch.hann_window(n_fft)
+    out = []
+    for ch in range(gen.shape[0]):
+        G = torch.stft(torch.from_numpy(np.ascontiguousarray(gen[ch])),
+                       n_fft, hop, window=win, return_complex=True)
+        O = torch.stft(torch.from_numpy(np.ascontiguousarray(orig[ch])),
+                       n_fft, hop, window=win, return_complex=True)
+        m = min(G.shape[1], O.shape[1])
+        G, O = G[:, :m], O[:, :m]
+        mag = (G.abs() - O.abs()).clamp(min=0.0)
+        y = torch.istft(mag * torch.exp(1j * G.angle()), n_fft, hop,
+                        window=win, length=gen.shape[1])
+        out.append(y.numpy())
+    return np.stack(out).astype(np.float32)
+
+
 def _match_rms(gen: np.ndarray, ref: np.ndarray, a: int, b: int) -> np.ndarray:
     """생성 구간의 음량을 원본 구간에 맞춘다 — 구간만 조용해지는
     '음질 다운' 인상 방지. 원본이 무음(빈 블록)이면 건드리지 않는다."""
@@ -449,29 +474,44 @@ def _run_job(job: dict):
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
             mode_e = (e.get("mode") or "inpaint").lower()
             if mode_e == "overlay":
-                # overlay — 원본은 1샘플도 안 바꾸고, 요청한 요소만 t2a로
-                # 따로 생성해 구간 위에 '얹는다'. "추가해줘" 지시에서 다른
-                # 소리가 바뀌어버리는 a2a 의 구조적 한계를 우회하는 모드.
+                # overlay v2 — 문맥 조건 차분 추출: t2a 고립 생성은 곡의 음색·
+                # 그루브를 몰라 '안 어울리는' 소리를 냈다(실사고). 대신
+                # ① 구간±문맥을 inpaint (곡 팔레트를 물려받은 결과)
+                # ② 원본에 없던 성분만 스펙트럼 차로 추출
+                # ③ 원본 위에 얹기 — 어울림은 inpaint 가, 보존은 차분이 담당.
                 a, b = int(s_rel * SR), min(int(t_rel * SR), inst_cur.shape[1])
-                seg0 = np.zeros((2, b - a), dtype=np.float32)
+                wa = max(0.0, s_rel - A2A_CTX_S)
+                wb = min(inst_cur.shape[1] / SR, t_rel + A2A_CTX_S)
+                ia, ib = int(wa * SR), int(wb * SR)
+                seg = np.ascontiguousarray(inst_cur[:, ia:ib])
+                ra, rb = int((s_rel - wa) * SR), int((t_rel - wa) * SR)
                 opts2 = dict(opts)
-                opts2["mode"] = "t2a"
-                gen = _inpaint(seg0, 0.0, 0.0, e["prompt"], opts2,
+                opts2["mode"] = "inpaint"
+                gen = _inpaint(seg, s_rel - wa, t_rel - wa, e["prompt"], opts2,
                                lambda p: phase(f"{tagp} · {p}", f0))
-                gen = _align_len(gen, seg0)
+                gen = _align_len(gen, seg)
+                gen, lag = _phase_align(gen, seg, ra, rb)
+                if lag:
+                    _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
+                elem = _spectral_new(gen[:, ra:rb], seg[:, ra:rb])
                 ref = inst_cur[:, a:b]
                 ref_rms = float(np.sqrt(np.mean(ref ** 2))) or 1e-4
-                g_rms = float(np.sqrt(np.mean(gen ** 2))) or 1e-4
+                e_rms = float(np.sqrt(np.mean(elem ** 2)))
+                if e_rms < 0.02 * ref_rms:
+                    _log("  overlay: 모델이 추가한 성분이 미미 — 이 연산은 건너뜀")
+                    continue
                 # strength = 얹는 크기: 0.25 은은 · 0.4 또렷 · 0.55 전면
                 lvl = min(max(float(e.get("strength") or 0.4), 0.15), 0.9)
-                gen *= (ref_rms / g_rms) * lvl * 1.6
+                elem *= (ref_rms / max(e_rms, 0.05 * ref_rms)) * lvl * 1.2
+                n_el = min(elem.shape[1], b - a)
                 xf0 = int(0.03 * SR)
-                if gen.shape[1] > 2 * xf0:      # 요소 양끝 페이드 (클릭 방지)
+                if n_el > 2 * xf0:              # 요소 양끝 페이드 (클릭 방지)
                     r0 = np.linspace(0.0, 1.0, xf0, dtype=np.float32)
-                    gen[:, :xf0] *= r0
-                    gen[:, -xf0:] *= r0[::-1]
-                inst_cur[:, a:b] = inst_cur[:, a:b] + gen
-                _log(f"  overlay: 요소 RMS ×{lvl * 1.6:.2f} (원본 무변경, 위에 합성)")
+                    elem[:, :xf0] *= r0
+                    elem[:, n_el - xf0:n_el] *= r0[::-1]
+                inst_cur[:, a:a + n_el] = inst_cur[:, a:a + n_el] + elem[:, :n_el]
+                _log(f"  overlay: 문맥 추가분 RMS {e_rms:.4f} → ×{lvl * 1.2:.2f} 로 합성"
+                     f" (원본 무변경)")
                 continue
             # 생성은 항상 '구간 ± 문맥 창'만 — a2a 는 좁게(충실도), inpaint 는
             # 넓게(앞뒤 흐름). 창 밖은 어차피 손대지 않고, 전곡 생성은 느린 데다
