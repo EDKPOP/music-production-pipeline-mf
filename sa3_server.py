@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.2-phase"
+VERSION = "sa3-v4.3-apg"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -68,7 +68,7 @@ INPAINT_CTX_S = float(os.environ.get("SA3_INPAINT_CTX_S", 60))
 # 분리 스템(악기 블리드 포함)을 얹지 않는다 — 반주 구간 음질 열화 방지
 VOCAL_MIN_RATIO = 0.05
 NEG_PROMPT = ("low quality, muffled, lo-fi, noisy, distorted, degraded audio, "
-              "artifacts, harsh, tinny")
+              "artifacts, harsh, tinny, dark, dull")
 MAX_AUDIO_S = float(os.environ.get("SA3_MAX_AUDIO_S", 370))  # 모델 상한 380s 아래 안전선
 # 기본은 '상주' — 리터치를 연달아 할 때 매번 로드하지 않는다. GPU가 MF에
 # 필요해지면 맥의 중재자가 POST /unload 로 내린다 (SA3_UNLOAD_EACH=1 이면
@@ -221,13 +221,16 @@ def _inpaint(inst: np.ndarray, start_s: float, end_s: float, prompt: str,
         # cfg 1~4 는 실측 정상(0.5~3%) — 기본 2.0, 상한 4.5 로 강제.
         cfg_scale=min(max(float(extra.get("cfg_scale") or 2.0), 1.0), 4.5),
     )
-    # negative_prompt 는 기본 미사용 — cfg 와 결합해 품질 붕괴를 일으킨
-    # 당사자다. 클라이언트가 명시로 보낼 때만 전달.
+    # negative 는 cfg>1 과 결합하면 백색잡음 붕괴(실사고), 반대로 APG 체제
+    # (cfg=1)에서는 inpaint 의 '먹먹함'을 걷어내는 실측 효과가 있다
+    # (센트로이드 777→1202Hz) — cfg가 1일 때만 기본 적용한다.
     neg = str(extra.get("negative") or "").strip()
+    if not neg and common["cfg_scale"] <= 1.01:
+        neg = NEG_PROMPT
     if neg:
         common["negative_prompt"] = neg
-    if extra.get("apg_scale") is not None:   # APG(대안 유도) 실험용 패스스루
-        common["apg_scale"] = float(extra["apg_scale"])
+    if extra.get("apg_scale") is not None:   # APG — 노이즈 없는 준수 강화 (실측)
+        common["apg_scale"] = min(max(float(extra["apg_scale"]), 1.0), 10.0)
     if mode == "a2a":
         # audio-to-audio: 원본 반주를 초기값으로 깔고 노이즈를 부분만 섞어
         # 뼈대(멜로디·리듬)를 유지한 채 변형. 창 전체가 다시 그려지지만
