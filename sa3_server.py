@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.1-guidance"
+VERSION = "sa3-v4.2-phase"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -289,6 +289,47 @@ def _align_len(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
     return np.concatenate([gen, ref[:, gen.shape[1]:]], axis=1)
 
 
+PHASE_MAX_LAG_S = 0.045   # 위상 정렬 탐색 폭 — 지각적 페이징은 수십 ms 대
+
+
+def _phase_align(gen: np.ndarray, ref: np.ndarray, a: int, b: int):
+    """접합 경계의 위상 정렬 — 페이징(빗질 소리) 근본 대책.
+
+    생성물이 원본과 수십 ms 어긋난 채 크로스페이드되면 두 파형이 간섭해
+    페이징이 난다. 마스크 양 경계 주변 파형의 상호상관으로 지연을 실측해
+    생성물 전체를 그만큼 밀어 원본 그리드에 맞춘다 (최대 ±45ms).
+    반환 (정렬된 gen, 적용 지연 샘플)."""
+    n = gen.shape[1]
+    max_lag = int(PHASE_MAX_LAG_S * SR)
+    win = int(0.25 * SR)
+    corr = None
+    for edge in (a, b):
+        lo = max(edge - win, 0)
+        hi = min(edge + win, n, ref.shape[1])
+        if hi - lo < max_lag * 3:
+            continue
+        r = ref[:, lo:hi].mean(0)
+        g = gen[:, lo:hi].mean(0)
+        if float(np.sqrt((r ** 2).mean())) < 1e-3:
+            continue                     # 원본이 사실상 무음 — 정렬 무의미
+        L = hi - lo
+        c = np.correlate(r, g, "full")[L - 1 - max_lag: L + max_lag]
+        corr = c if corr is None else corr + c
+    if corr is None or not len(corr):
+        return gen, 0
+    lag = int(np.argmax(corr)) - max_lag   # out[j] = gen[j - lag] 이 최적 정합
+    if lag == 0:
+        return gen, 0
+    out = np.empty_like(gen)
+    if lag > 0:
+        out[:, lag:] = gen[:, :n - lag]
+        out[:, :lag] = gen[:, :1]
+    else:
+        out[:, :n + lag] = gen[:, -lag:]
+        out[:, n + lag:] = gen[:, -1:]
+    return out, lag
+
+
 def _match_rms(gen: np.ndarray, ref: np.ndarray, a: int, b: int) -> np.ndarray:
     """생성 구간의 음량을 원본 구간에 맞춘다 — 구간만 조용해지는
     '음질 다운' 인상 방지. 원본이 무음(빈 블록)이면 건드리지 않는다."""
@@ -413,6 +454,9 @@ def _run_job(job: dict):
                            lambda p: phase(f"{tagp} · {p}", f0))
             gen = _align_len(gen, seg)
             if not e.get("fill"):
+                gen, lag = _phase_align(gen, seg, ra, rb)
+                if lag:
+                    _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
                 gen = _match_rms(gen, seg, ra, rb)
             inst_cur[:, ia:ib] = _splice(seg, gen, s_rel - wa, t_rel - wa)
 
@@ -611,7 +655,7 @@ def diag():
 def edit(r: EditReq):
     if r.edits:
         edits = []
-        for e in r.edits[:16]:
+        for e in r.edits[:24]:
             try:
                 edits.append({
                     "start_s": float(e.get("start_s", e.get("start"))),
