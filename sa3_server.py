@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.5-ctx-overlay"
+VERSION = "sa3-v4.6-eqmatch"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -363,6 +363,38 @@ def _spectral_new(gen: np.ndarray, orig: np.ndarray) -> np.ndarray:
     return np.stack(out).astype(np.float32)
 
 
+def _match_spectrum(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """생성 창의 장기 스펙트럼 기울기를 원본 창에 매칭 — 강한 cfg 유도의
+    '어두워짐' 비용을 사후 EQ 로 상쇄한다 (실측: 평탄도 0.120→0.019,
+    센트로이드 690→1316Hz). 강한 스무딩 + 클램프(-6dB~+12dB)로 미세 구조와
+    프롬프트가 의도한 추가 성분은 보존한다. SA3_EQ_MATCH=0 으로 끌 수 있다."""
+    if os.environ.get("SA3_EQ_MATCH", "1") == "0":
+        return gen
+    n = min(gen.shape[1], ref.shape[1])
+    if n < SR // 2:
+        return gen
+    if float(np.sqrt(np.mean(ref[:, :n] ** 2))) < 1e-3:
+        return gen                                  # 원본이 무음(빈 블록) — 기준 없음
+    G = np.abs(np.fft.rfft(gen[:, :n].mean(0)))
+    R = np.abs(np.fft.rfft(ref[:, :n].mean(0)))
+    # 비율을 직접 스무딩하면 G≈0 지점의 폭주 비율이 평균을 지배한다 —
+    # 분자/분모를 각각 스무딩한 뒤 나눠야 안정적인 EQ 커브가 나온다
+    w = max(64, len(G) // 40)
+    Gs = np.convolve(G, np.ones(w) / w, mode="same")
+    Rs = np.convolve(R, np.ones(w) / w, mode="same")
+    fr = np.arange(len(G), dtype=np.float32)
+    c_g = float((Gs ** 2 * fr).sum() / max((Gs ** 2).sum(), 1e-9))
+    c_r = float((Rs ** 2 * fr).sum() / max((Rs ** 2).sum(), 1e-9))
+    if c_g >= 0.8 * c_r:
+        return gen        # 이미 원본급 밝기 — EQ 는 어두워진 결과 전용 (실측)
+    _log(f"  EQ 매칭: 센트로이드 {c_g / c_r * 100:.0f}% → 원본 기울기로 보정")
+    k = np.clip(Rs / np.maximum(Gs, 1e-9), 0.5, 4.0)
+    spec = np.fft.rfft(gen, axis=1)
+    k2 = np.interp(np.linspace(0, 1, spec.shape[1]), np.linspace(0, 1, len(k)), k)
+    out = np.fft.irfft(spec * k2, n=gen.shape[1], axis=1)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 def _match_rms(gen: np.ndarray, ref: np.ndarray, a: int, b: int) -> np.ndarray:
     """생성 구간의 음량을 원본 구간에 맞춘다 — 구간만 조용해지는
     '음질 다운' 인상 방지. 원본이 무음(빈 블록)이면 건드리지 않는다."""
@@ -531,6 +563,7 @@ def _run_job(job: dict):
                 gen, lag = _phase_align(gen, seg, ra, rb)
                 if lag:
                     _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
+                gen = _match_spectrum(gen, seg)     # 유도發 어두움 보정 (EQ 매칭)
                 gen = _match_rms(gen, seg, ra, rb)
             inst_cur[:, ia:ib] = _splice(seg, gen, s_rel - wa, t_rel - wa)
 
