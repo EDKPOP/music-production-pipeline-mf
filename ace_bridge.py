@@ -81,10 +81,27 @@ def _decode_any(raw: bytes):
 
 
 def _resample(wav: np.ndarray, sr_from: int, sr_to: int) -> np.ndarray:
-    import torch
-    import torchaudio
-    return torchaudio.functional.resample(
-        torch.from_numpy(np.ascontiguousarray(wav)), sr_from, sr_to).numpy()
+    """48k(ACE) → 44.1k(계약) — MF venv 에 torchaudio 가 없을 수 있어 폴백 체인."""
+    try:
+        import torch
+        import torchaudio
+        return torchaudio.functional.resample(
+            torch.from_numpy(np.ascontiguousarray(wav)), sr_from, sr_to).numpy()
+    except Exception:
+        pass
+    try:
+        from math import gcd
+        from scipy.signal import resample_poly
+        g = gcd(sr_from, sr_to)
+        return resample_poly(wav, sr_to // g, sr_from // g,
+                             axis=1).astype(np.float32)
+    except Exception:
+        pass
+    _log("⚠ torchaudio/scipy 없음 — 선형 보간 리샘플 (고역 품질 소폭 저하)")
+    n_new = int(round(wav.shape[1] * sr_to / sr_from))
+    x_old = np.linspace(0.0, 1.0, wav.shape[1])
+    x_new = np.linspace(0.0, 1.0, n_new)
+    return np.stack([np.interp(x_new, x_old, ch) for ch in wav]).astype(np.float32)
 
 
 def _encode_wav(wav: np.ndarray) -> str:
