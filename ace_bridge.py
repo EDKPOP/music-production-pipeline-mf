@@ -340,9 +340,12 @@ def _run_job(job: dict):
                     "prompt": e["prompt"],
                     "repainting_start": e["start_s"],
                     "repainting_end": e["end_s"],
-                    "audio_duration": round(dur, 2),
-                    # 실측: thinking(LM 보강)이 밝기·평탄도 최선, 속도 동일
-                    "thinking": "true"}
+                    "audio_duration": round(dur, 2)}
+            # (thinking 은 repaint 에서 LM 자동 생략 — 공식 문서. 보내지 않는다)
+            if e.get("audio_cover_strength") is not None:
+                # 1.0=원본 고수 … 0.1=자유 해석 (공식 문서의 원본 유지 노브)
+                data["audio_cover_strength"] = min(
+                    max(float(e["audio_cover_strength"]), 0.05), 1.0)
             if e.get("bpm"):
                 data["bpm"] = int(float(e["bpm"]))
             if job.get("seed") is not None:
@@ -450,6 +453,7 @@ def edit(r: EditReq):
                 "prompt": str(e.get("prompt") or "").strip(),
                 "lyrics": e.get("lyrics"),
                 "bpm": e.get("bpm"),
+                "audio_cover_strength": e.get("audio_cover_strength"),
                 "label": str(e.get("label") or ""),
             })
         except (TypeError, ValueError):
