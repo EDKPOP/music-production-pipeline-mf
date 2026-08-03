@@ -141,7 +141,9 @@ def _match_spectrum(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
     fr = np.arange(len(G), dtype=np.float32)
     c_g = float((Gs ** 2 * fr).sum() / max((Gs ** 2).sum(), 1e-9))
     c_r = float((Rs ** 2 * fr).sum() / max((Rs ** 2).sum(), 1e-9))
-    if c_g >= 0.8 * c_r:
+    if c_g >= 0.95 * c_r:
+        # 문턱 0.8→0.95 (실사고: 반주 기준 83%가 통과해 최종 믹스가 52~61%
+        # 밝기로 먹먹 — repaint 는 거의 항상 어둡게 나오므로 적극 보정)
         return gen
     _log(f"  EQ 매칭: 센트로이드 {c_g / c_r * 100:.0f}% → 원본 기울기로 보정")
     k = np.clip(Rs / np.maximum(Gs, 1e-9), 0.5, 4.0)
