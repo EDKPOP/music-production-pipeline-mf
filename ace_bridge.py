@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v1.0-bridge"
+VERSION = "ace-v1.1-stems"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 MODEL = os.environ.get("ACE_MODEL", "")          # ""=서버 기본(turbo)
@@ -330,7 +330,23 @@ def _run_job(job: dict):
             if not (0 <= s < t <= dur + 0.5):
                 raise ValueError(f"구간이 곡 길이를 벗어남: {s}~{t}s (곡 {dur:.1f}s)")
             e["start_s"], e["end_s"] = s, min(t, dur)
-        cur = wav.copy()
+        # v1.1: 보컬 스템이 오면 SA3 와 같은 구조 — 반주만 repaint 하고 보컬은
+        # 원본을 재합성한다. 실측: ACE repaint 는 acs 0.9·가사 전달로도 원본
+        # 보컬을 재현하지 못한다(보컬상관 ~0) — 풀믹스 repaint 는 보컬 소실.
+        vocals = None
+        vb64 = job.pop("vocals_b64", None)
+        if vb64:
+            phase("보컬 스템 수신 — 반주만 repaint (보컬 원본 보존)", 0.08)
+            vocals = _decode_wav(vb64)
+            if vocals.shape[1] < wav.shape[1]:
+                vocals = np.concatenate(
+                    [vocals, np.zeros((2, wav.shape[1] - vocals.shape[1]),
+                                      np.float32)], axis=1)
+            vocals = np.ascontiguousarray(vocals[:, :wav.shape[1]])
+            work = wav - vocals              # 반주 = 믹스 − 보컬 (합 보존)
+        else:
+            work = wav
+        cur = work.copy()
         total = len(edits)
         for i, e in enumerate(edits):
             f0 = 0.15 + 0.75 * i / total
@@ -369,11 +385,31 @@ def _run_job(job: dict):
             gen = gen.copy()
             gen[:, a:a + fixed.shape[1]] = fixed
             cur = _splice(cur, gen, e["start_s"], e["end_s"])
+        if vocals is not None:
+            # 보컬 재합성 — 마스크 구간만 (밖은 어차피 원본 믹스로 스플라이스).
+            # 보컬 게이트: 구간에 보컬이 사실상 없으면 스템(블리드)을 얹지 않는다.
+            phase("보컬 재합성", 0.9)
+            mixed = cur + vocals
+            out_mix = wav.copy()
+            for e in edits:
+                a, b = int(e["start_s"] * SR), min(int(e["end_s"] * SR),
+                                                   wav.shape[1])
+                v_rms = float(np.sqrt(np.mean(vocals[:, a:b] ** 2))) if b > a else 0.0
+                m_rms = float(np.sqrt(np.mean(wav[:, a:b] ** 2))) if b > a else 0.0
+                layer = mixed
+                if v_rms < max(1e-3, 0.05 * m_rms):
+                    layer = cur
+                    _log(f"  보컬 게이트: {e['start_s']:.1f}~{e['end_s']:.1f}s "
+                         "보컬 미검출 — 반주만 합성")
+                out_mix = _splice(out_mix, layer, e["start_s"], e["end_s"])
+            cur = out_mix
         peak = float(np.abs(cur).max() or 1.0)
         if peak > 1.0:
             cur = cur / peak * 0.999
         phase("인코딩", 0.95)
         job["result_b64"] = _encode_wav(cur)
+        if vocals is not None:   # 스템 사이드카 순환 — 다음 체이닝에 재사용
+            job["stem_b64"] = _encode_wav(vocals)
         job["sr"] = SR
         job["status"], job["phase"], job["progress"] = "done", "완료", 1.0
         _log(f"잡 {job['id'][:8]} 완료 — {time.time()-t0:.0f}s, {total}건")
@@ -402,6 +438,7 @@ def _worker():
             done = [j for j in _jobs.values() if j["status"] in ("done", "failed")]
             for j in sorted(done, key=lambda x: x["created"])[:-RESULT_KEEP]:
                 j.pop("result_b64", None)
+                j.pop("stem_b64", None)
 
 
 def _busy() -> bool:
@@ -411,8 +448,8 @@ def _busy() -> bool:
 class EditReq(BaseModel):
     audio_b64: str
     edits: list = None
-    keep_vocals: bool = True     # 호환 필드 — ACE 는 풀믹스 repaint (분리 불필요)
-    vocals_b64: str = None       # 호환 필드 — 무시
+    keep_vocals: bool = True     # 호환 필드
+    vocals_b64: str = None       # 보컬 스템 — 있으면 반주만 repaint (보컬 보존)
     seed: int = None
     steps: int = None
 
@@ -491,7 +528,10 @@ def job_result(jid: str):
         return JSONResponse(status_code=409, content={"detail": j["status"]})
     if "result_b64" not in j:
         return JSONResponse(status_code=410, content={"detail": "결과 만료"})
-    return {"audio_b64": j["result_b64"], "sr": j["sr"]}
+    out = {"audio_b64": j["result_b64"], "sr": j["sr"]}
+    if j.get("stem_b64"):
+        out["vocals_b64"] = j["stem_b64"]
+    return out
 
 
 class DiagReq(BaseModel):
