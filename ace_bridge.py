@@ -424,7 +424,10 @@ def _run_job(job: dict):
         # 없으면 여기서 demucs 로 자동 분리한다. 사용자는 스템을 몰라도 된다.
         vocals = None
         vb64 = job.pop("vocals_b64", None)
-        if vb64:
+        need_inst = any(not e.get("vocal_edit") for e in edits)
+        if not need_inst:
+            phase("전 예약이 보컬 편집 — 분리 생략, 풀믹스 repaint", 0.08)
+        elif vb64:
             phase("보컬 스템 재사용 — 반주만 repaint (보컬 원본 보존)", 0.08)
             vocals = _decode_wav(vb64)
         elif job.get("keep_vocals", True):
@@ -438,17 +441,27 @@ def _run_job(job: dict):
             work = wav - vocals              # 반주 = 믹스 − 보컬 (합 보존)
         else:
             work = wav
-        cur = work.copy()
+        cur = work.copy()               # 반주(또는 보컬 없는 경우 믹스) 타임라인
+        mix_cur = wav.copy()            # 풀믹스 타임라인 — vocal_edit 결과 누적
+        vocal_edited = False
         total = len(edits)
         for i, e in enumerate(edits):
             f0 = 0.15 + 0.75 * i / total
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
             phase(f"{tagp} · ACE repaint {e['start_s']:.1f}~{e['end_s']:.1f}s", f0)
+            v_edit = bool(e.get("vocal_edit"))
+            src_buf = mix_cur if v_edit else cur
             data = {"task_type": "repaint",
                     "prompt": e["prompt"],
                     "repainting_start": e["start_s"],
                     "repainting_end": e["end_s"],
                     "audio_duration": round(dur, 2)}
+            if v_edit:
+                phase(f"{tagp} · 보컬 편집 — 풀믹스 repaint (새 가창)", f0)
+                if e.get("lyrics"):
+                    data["lyrics"] = e["lyrics"]
+                if e.get("vocal_language"):
+                    data["vocal_language"] = e["vocal_language"]
             # (thinking 은 repaint 에서 LM 자동 생략 — 공식 문서. 보내지 않는다)
             if "turbo" not in MODEL:
                 # base 계열: CFG 실동작 — 클라 준수강도(cfg_scale 1.5~3.0)를
@@ -466,29 +479,34 @@ def _run_job(job: dict):
                 data["use_random_seed"] = "false"
             if e.get("lyrics"):
                 data["lyrics"] = e["lyrics"]
-            gen = _ace_task(data, src_wav=cur,
+            gen = _ace_task(data, src_wav=src_buf,
                             phase=lambda p: phase(f"{tagp} · {p}", f0))
             # 길이 정렬 → 위상 정렬 → 마스크만 스플라이스 (원본 보존 보장)
-            if gen.shape[1] < cur.shape[1]:
+            if gen.shape[1] < src_buf.shape[1]:
                 gen = np.concatenate(
-                    [gen, cur[:, gen.shape[1]:]], axis=1)
-            gen = gen[:, : cur.shape[1]]
+                    [gen, src_buf[:, gen.shape[1]:]], axis=1)
+            gen = gen[:, : src_buf.shape[1]]
             a, b = int(e["start_s"] * SR), int(e["end_s"] * SR)
-            gen, lag = _phase_align(gen, cur, a, b)
+            gen, lag = _phase_align(gen, src_buf, a, b)
             if lag:
                 _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
             # 마스크 구간만 EQ 매칭 (ACE 어두움 보정) 후 스플라이스
-            fixed = _match_spectrum(gen[:, a:b], cur[:, a:b])
+            fixed = _match_spectrum(gen[:, a:b], src_buf[:, a:b])
             gen = gen.copy()
             gen[:, a:a + fixed.shape[1]] = fixed
-            cur = _splice(cur, gen, e["start_s"], e["end_s"])
+            if v_edit:
+                mix_cur = _splice(mix_cur, gen, e["start_s"], e["end_s"])
+                vocal_edited = True
+            else:
+                cur = _splice(cur, gen, e["start_s"], e["end_s"])
         if vocals is not None:
-            # 보컬 재합성 — 마스크 구간만 (밖은 어차피 원본 믹스로 스플라이스).
-            # 보컬 게이트: 구간에 보컬이 사실상 없으면 스템(블리드)을 얹지 않는다.
+            # 반주 편집 구간을 풀믹스 타임라인에 재합성 (보컬 게이트).
+            # vocal_edit 구간은 이미 mix_cur 에 반영되어 건드리지 않는다.
             phase("보컬 재합성", 0.9)
             mixed = cur + vocals
-            out_mix = wav.copy()
             for e in edits:
+                if e.get("vocal_edit"):
+                    continue
                 a, b = int(e["start_s"] * SR), min(int(e["end_s"] * SR),
                                                    wav.shape[1])
                 v_rms = float(np.sqrt(np.mean(vocals[:, a:b] ** 2))) if b > a else 0.0
@@ -498,14 +516,22 @@ def _run_job(job: dict):
                     layer = cur
                     _log(f"  보컬 게이트: {e['start_s']:.1f}~{e['end_s']:.1f}s "
                          "보컬 미검출 — 반주만 합성")
-                out_mix = _splice(out_mix, layer, e["start_s"], e["end_s"])
-            cur = out_mix
+                mix_cur = _splice(mix_cur, layer, e["start_s"], e["end_s"])
+            cur = mix_cur
+        elif vocal_edited:
+            # 분리 없는 잡(전부 보컬 편집 또는 keep_vocals=false) —
+            # 보컬 편집 구간만 풀믹스 결과를 반영
+            for e in edits:
+                if e.get("vocal_edit"):
+                    cur = _splice(cur, mix_cur, e["start_s"], e["end_s"])
         peak = float(np.abs(cur).max() or 1.0)
         if peak > 1.0:
             cur = cur / peak * 0.999
         phase("인코딩", 0.95)
         job["result_b64"] = _encode_wav(cur)
-        if vocals is not None:   # 스템 사이드카 순환 — 다음 체이닝에 재사용
+        if vocals is not None and not vocal_edited:
+            # 스템 사이드카 순환 — 보컬을 편집했다면 스템이 낡았으므로 생략
+            # (다음 리터치에서 자동 재분리가 정합성을 보장)
             job["stem_b64"] = _encode_wav(vocals)
         job["sr"] = SR
         job["status"], job["phase"], job["progress"] = "done", "완료", 1.0
@@ -607,6 +633,8 @@ def edit(r: EditReq):
                 "bpm": e.get("bpm"),
                 "audio_cover_strength": e.get("audio_cover_strength"),
                 "cfg_scale": e.get("cfg_scale"),
+                "vocal_edit": bool(e.get("vocal_edit")),
+                "vocal_language": e.get("vocal_language"),
                 "label": str(e.get("label") or ""),
             })
         except (TypeError, ValueError):
