@@ -36,10 +36,11 @@ from pydantic import BaseModel
 VERSION = "ace-v2-arbiter-stems"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
-# 3090(24GB) 티어 권장: XL(4B) DiT — repaint 는 base 계열 보장 + guidance 실동작.
-# LM 은 repaint 에서 자동 생략(공식)이라 싣지 않는다 (VRAM·로드시간 절약).
-MODEL = os.environ.get("ACE_MODEL", "acestep-v15-xl-base")
-STEPS = int(os.environ.get("ACE_STEPS", 32))     # base 계열 권장 32~64
+# 모델 선택 — 실측(2026-08-03, 같은 시드·같은 구간)이 문서 티어 권장을 뒤집음:
+#   xl-base: 평탄도 0.102·538Hz(잡음·먹먹) / turbo 계열: 0.057·1080Hz·2배 빠름.
+# repaint 워크로드에선 turbo 가 우세 — XL 은 이득 없음. (gs 는 base 전용)
+MODEL = os.environ.get("ACE_MODEL", "acestep-v15-turbo")
+STEPS = int(os.environ.get("ACE_STEPS", 8))      # turbo 권장 8
 ACE_DIR = os.environ.get("ACE_DIR", "")          # 설정 시 브리지가 upstream 수명 관리
 _proc = None                                     # 관리 중인 acestep-api 프로세스
 XFADE_S = 0.10

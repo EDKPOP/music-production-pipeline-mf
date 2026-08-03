@@ -2,7 +2,7 @@
 chcp 65001 >nul
 rem ACE-Step 1.5 시동 (run.bat [3/3] 또는 run_ace.bat 이 호출)
 rem v2: 브리지가 upstream(acestep-api)을 스스로 스폰/종료 - MF 와 GPU 교대.
-rem 창은 브리지 하나만 뜬다. 모델: 3090 티어 = acestep-v15-xl-base.
+rem 창은 브리지 하나만 뜬다. 모델: turbo (실측 — repaint 는 XL-base 보다 우세).
 
 where uv >nul 2>nul
 if errorlevel 1 (
@@ -40,7 +40,7 @@ if errorlevel 1 (
 )
 
 set "ACE_DIR=%ACEDIR%"
-set "ACE_MODEL=acestep-v15-xl-base"
+set "ACE_MODEL=acestep-v15-turbo"
 echo      브리지 시작 - 새 창 "ace-bridge 8600" (upstream 은 리터치 시작 때 자동 기동)
 start "ace-bridge 8600" cmd /k "%~dp0_ace_bridge.bat"
 exit /b 0
