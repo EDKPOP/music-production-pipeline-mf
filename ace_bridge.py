@@ -174,7 +174,7 @@ def _ace_task(data: dict, src_wav: np.ndarray = None, timeout_s: float = 300,
     if src_wav is not None:
         files = {"src_audio": ("src.wav", _wav_bytes(src_wav), "audio/wav")}
     r = requests.post(f"{UPSTREAM}/release_task", data=fields, files=files,
-                      timeout=120)
+                      timeout=600)
     r.raise_for_status()
     body = r.json()
     if body.get("error"):
@@ -215,6 +215,55 @@ def _upstream_ok() -> dict:
         return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
 
 
+def _models() -> list:
+    try:
+        d = requests.get(f"{UPSTREAM}/v1/models", timeout=10).json().get("data")
+        if isinstance(d, dict):
+            return d.get("models") or []
+        return d or []
+    except Exception:
+        return []
+
+
+_MODEL_READY = {"ok": False}
+
+
+def _ensure_model(phase=lambda p: None) -> bool:
+    """DiT 모델 초기화 보장 — ACE 서버는 /v1/init 전엔 모델이 비어 있고
+    /release_task 가 무한 대기한다 (실측: models=[] + POST 120s 타임아웃).
+    기동 시·첫 잡 전에 호출한다. 다운로드 포함 최대 20분 폴링."""
+    if _MODEL_READY["ok"] or _models():
+        _MODEL_READY["ok"] = True
+        return True
+    phase("ACE 모델 초기화 요청 — 최초엔 다운로드·로드로 수 분")
+    _log(f"/v1/init 호출 (model={MODEL or 'acestep-v15-turbo'}, init_llm=True)")
+    try:
+        r = requests.post(f"{UPSTREAM}/v1/init",
+                          json={"model": MODEL or "acestep-v15-turbo",
+                                "init_llm": True}, timeout=1800)
+        _log(f"/v1/init 응답: {str(r.text)[:200]}")
+    except Exception as e:
+        _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
+    for _ in range(120):
+        if _models():
+            _MODEL_READY["ok"] = True
+            phase("ACE 모델 준비 완료")
+            _log("ACE 모델 준비 완료")
+            return True
+        time.sleep(10)
+    return False
+
+
+def _boot_watch():
+    """기동 도우미 — 업스트림(공식 서버)이 뜰 때까지 기다렸다가 모델 초기화.
+    브리지를 먼저 켜도 순서 문제가 없다."""
+    for _ in range(360):                # 최대 1시간 (최초 모델 다운로드 감안)
+        if _upstream_ok()["ok"]:
+            break
+        time.sleep(10)
+    _ensure_model()
+
+
 # ── 잡 워커 (sa3 계약과 동일한 수명주기) ──────────────────────────
 def _run_job(job: dict):
     def phase(p, prog=None):
@@ -225,6 +274,8 @@ def _run_job(job: dict):
 
     t0 = time.time()
     try:
+        if not _ensure_model(lambda p: phase(p, 0.03)):
+            raise RuntimeError("ACE 모델 초기화 실패 — ace-api 창을 확인하세요")
         phase("오디오 디코드", 0.05)
         wav = _decode_wav(job.pop("audio_b64"))
         dur = wav.shape[1] / SR
@@ -313,9 +364,14 @@ class EditReq(BaseModel):
 @app.get("/health")
 def health():
     up = _upstream_ok()
+    models = _models() if up["ok"] else []
+    if models:
+        _MODEL_READY["ok"] = True
     return {"status": "ok" if up["ok"] else "upstream_down",
             "version": VERSION, "cuda": up["ok"],   # 업스트림 living = GPU 가동
-            "model_loaded": up["ok"], "max_audio_s": MAX_AUDIO_S,
+            "model_loaded": bool(models),
+            "ace_models": [m.get("name") for m in models if isinstance(m, dict)],
+            "max_audio_s": MAX_AUDIO_S,
             "busy": _busy(), "modes": ["inpaint", "a2a", "overlay", "repaint"],
             "flash_attn": True, "flash_attn_info": "(ace)",
             "engine": "ace-step-1.5", "upstream": UPSTREAM,
@@ -398,6 +454,9 @@ def diag(r: DiagReq):
     (맥의 Claude 가 파라미터 실험을 자유롭게 돌리는 통로)."""
     if _busy():
         return JSONResponse(status_code=409, content={"error": "busy"})
+    if not _ensure_model():
+        return JSONResponse(status_code=503,
+                            content={"error": "ACE 모델 초기화 실패 — ace-api 창 확인"})
     info = {"upstream": UPSTREAM, "health": _upstream_ok()}
     try:
         info["models"] = requests.get(f"{UPSTREAM}/v1/models", timeout=8).json().get("data")
@@ -447,7 +506,8 @@ if __name__ == "__main__":
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
     threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_boot_watch, daemon=True).start()
     up = _upstream_ok()
     _log(f"ACE 브리지 {VERSION} — {args.host}:{args.port} → 업스트림 {UPSTREAM} "
-         f"({'연결됨' if up['ok'] else '연결 안 됨 — acestep-api 가 켜져 있는지 확인'})")
+         f"({'연결됨' if up['ok'] else '대기 — acestep-api 가 뜨면 자동 연결·모델 초기화'})")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
