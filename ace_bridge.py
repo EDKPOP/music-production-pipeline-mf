@@ -118,6 +118,34 @@ def _wav_bytes(wav: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+def _match_spectrum(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """마스크 구간 EQ 매칭 — ACE repaint 는 원본보다 크게 어둡게 나온다
+    (실측 센트로이드 659~916Hz vs 원본 1749). 생성 구간의 장기 스펙트럼
+    기울기를 원본 구간에 맞추면 원본급 밝기로 회복 (916→1801Hz, 평탄도
+    0.039→0.016, 반영 유지 실측). 원본 대비 80% 이상 밝으면 무개입."""
+    if os.environ.get("ACE_EQ_MATCH", "1") == "0":
+        return gen
+    n = min(gen.shape[1], ref.shape[1])
+    if n < SR // 2 or float(np.sqrt(np.mean(ref[:, :n] ** 2))) < 1e-3:
+        return gen
+    G = np.abs(np.fft.rfft(gen[:, :n].mean(0)))
+    R = np.abs(np.fft.rfft(ref[:, :n].mean(0)))
+    w = max(64, len(G) // 40)
+    Gs = np.convolve(G, np.ones(w) / w, mode="same")
+    Rs = np.convolve(R, np.ones(w) / w, mode="same")
+    fr = np.arange(len(G), dtype=np.float32)
+    c_g = float((Gs ** 2 * fr).sum() / max((Gs ** 2).sum(), 1e-9))
+    c_r = float((Rs ** 2 * fr).sum() / max((Rs ** 2).sum(), 1e-9))
+    if c_g >= 0.8 * c_r:
+        return gen
+    _log(f"  EQ 매칭: 센트로이드 {c_g / c_r * 100:.0f}% → 원본 기울기로 보정")
+    k = np.clip(Rs / np.maximum(Gs, 1e-9), 0.5, 4.0)
+    spec = np.fft.rfft(gen, axis=1)
+    k2 = np.interp(np.linspace(0, 1, spec.shape[1]), np.linspace(0, 1, len(k)), k)
+    out = np.fft.irfft(spec * k2, n=gen.shape[1], axis=1)
+    return np.ascontiguousarray(out, dtype=np.float32)
+
+
 def _splice(original: np.ndarray, generated: np.ndarray,
             start_s: float, end_s: float) -> np.ndarray:
     """마스크 구간만 generated — 등전력 크로스페이드 (sa3_server 와 동일)."""
@@ -312,7 +340,11 @@ def _run_job(job: dict):
                     "prompt": e["prompt"],
                     "repainting_start": e["start_s"],
                     "repainting_end": e["end_s"],
-                    "audio_duration": round(dur, 2)}
+                    "audio_duration": round(dur, 2),
+                    # 실측: thinking(LM 보강)이 밝기·평탄도 최선, 속도 동일
+                    "thinking": "true"}
+            if e.get("bpm"):
+                data["bpm"] = int(float(e["bpm"]))
             if job.get("seed") is not None:
                 data["seed"] = int(job["seed"])
                 data["use_random_seed"] = "false"
@@ -329,6 +361,10 @@ def _run_job(job: dict):
             gen, lag = _phase_align(gen, cur, a, b)
             if lag:
                 _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
+            # 마스크 구간만 EQ 매칭 (ACE 어두움 보정) 후 스플라이스
+            fixed = _match_spectrum(gen[:, a:b], cur[:, a:b])
+            gen = gen.copy()
+            gen[:, a:a + fixed.shape[1]] = fixed
             cur = _splice(cur, gen, e["start_s"], e["end_s"])
         peak = float(np.abs(cur).max() or 1.0)
         if peak > 1.0:
@@ -413,6 +449,7 @@ def edit(r: EditReq):
                 "end_s": float(e.get("end_s", e.get("end"))),
                 "prompt": str(e.get("prompt") or "").strip(),
                 "lyrics": e.get("lyrics"),
+                "bpm": e.get("bpm"),
                 "label": str(e.get("label") or ""),
             })
         except (TypeError, ValueError):
