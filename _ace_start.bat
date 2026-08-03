@@ -32,8 +32,10 @@ if errorlevel 1 (
 )
 popd
 
+rem 자식 창은 ACEDIR 환경변수를 상속한다 - 인자 전달 없음
+rem (start /D "%~dp0" 는 끝 백슬래시가 따옴표를 이스케이프해 구문 오류를 냈다)
 echo   ACE 공식 서버 시작 - 새 창 "ace-api 8001" - 최초엔 모델 자동 다운로드 수 GB
-start "ace-api 8001" /D "%~dp0" _ace_api.bat "%ACEDIR%"
+start "ace-api 8001" cmd /k "%~dp0_ace_api.bat"
 echo   송캠프 브리지 시작 - 새 창 "ace-bridge 8600"
-start "ace-bridge 8600" /D "%~dp0" _ace_bridge.bat
+start "ace-bridge 8600" cmd /k "%~dp0_ace_bridge.bat"
 exit /b 0
