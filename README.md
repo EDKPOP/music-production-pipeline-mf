@@ -245,14 +245,19 @@ win_amd64 휠 선택 → ③ `pip --no-deps` 설치 → ④ 임포트 재검증�
 
 ## ACE-Step 1.5 리터치 엔진 (선택 — SA3 대체/비교용)
 
-**`run_ace.bat` 더블클릭 한 번**이면: uv 확인 → 저장소 클론(`%USERPROFILE%\ACE-Step-1.5`)
-→ `uv sync` → CUDA torch 검사·복구 → 창 2개 기동:
-- **"ace-api 8001"** — ACE 공식 REST 서버 (최초 실행 시 모델 자동 다운로드, 수 GB)
-- **"ace-bridge 8600"** — 송캠프 계약 통역 (`ace_bridge.py`, MF 레포 .venv 사용)
+**`run.bat` 하나로 함께 기동**된다 ([3/3] 단계 — 단독은 `run_ace.bat`):
+uv 확인 → 클론 → `uv sync` → CUDA 복구 → demucs 확보 → **"ace-bridge 8600" 창 하나**.
 
-브리지는 ACE repaint 결과에서 **마스크 구간만** 원본 위에 스플라이스한다
-(마스크 밖 보존을 모델과 무관하게 구조적으로 보장) + 위상 정렬·44.1k 리샘플.
-ACE 터보는 VRAM <4GB 라 **MF 와 공존** — GPU 교대가 필요 없다.
+v2 구조 (2026-08-03):
+- 모델: **acestep-v15-xl-base** (3090/24GB 티어 — repaint 는 base 계열 보장,
+  guidance 실동작). LM 미탑재(repaint 는 LM 자동 생략 — VRAM 절약)
+- **GPU 교대**: 공식 unload API 가 없어 브리지가 upstream(acestep-api)을
+  자식 프로세스로 **스폰/종료**한다 — /load(리터치 예열)·/unload(MF 양보).
+  기본은 내려간 상태, 리터치 시작 때 자동 기동
+- **스템 완전 자동화**: vocals_b64 사이드카가 오면 재사용(가속), 없으면
+  브리지가 demucs 로 자동 분리 → 반주만 repaint → 보컬 원본 재합성(게이트)
+  → 스템을 결과에 동봉해 다음 체이닝에 순환. 사용자는 스템을 몰라도 된다
+- 품질 체인: 위상 정렬 → EQ 매칭(어두움 보정) → 등전력 스플라이스 → 44.1k
 
 - 확인: `curl http://localhost:8600/health` → `"status":"ok"` (업스트림 연결까지 최초 수 분)
 - 방화벽: 8500 과 같은 방식으로 8600 허용

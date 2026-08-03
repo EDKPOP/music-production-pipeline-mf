@@ -33,11 +33,15 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v1.1-stems"
+VERSION = "ace-v2-arbiter-stems"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
-MODEL = os.environ.get("ACE_MODEL", "")          # ""=서버 기본(turbo)
-STEPS = int(os.environ.get("ACE_STEPS", 8))
+# 3090(24GB) 티어 권장: XL(4B) DiT — repaint 는 base 계열 보장 + guidance 실동작.
+# LM 은 repaint 에서 자동 생략(공식)이라 싣지 않는다 (VRAM·로드시간 절약).
+MODEL = os.environ.get("ACE_MODEL", "acestep-v15-xl-base")
+STEPS = int(os.environ.get("ACE_STEPS", 32))     # base 계열 권장 32~64
+ACE_DIR = os.environ.get("ACE_DIR", "")          # 설정 시 브리지가 upstream 수명 관리
+_proc = None                                     # 관리 중인 acestep-api 프로세스
 XFADE_S = 0.10
 MAX_AUDIO_S = 600.0
 RESULT_KEEP = 5
@@ -252,6 +256,81 @@ def _ace_task(data: dict, src_wav: np.ndarray = None, timeout_s: float = 300,
     return _decode_any(audio.content)
 
 
+def _spawn_upstream(log=print) -> bool:
+    """관리 모드: acestep-api 를 자식 프로세스로 기동 (ACE_DIR 필요).
+
+    공식 unload API 가 없으므로 MF 와의 GPU 교대는 프로세스 시작/종료로
+    구현한다 — kill 이 곧 VRAM 완전 해제다."""
+    global _proc
+    if not ACE_DIR:
+        return False
+    if _proc is not None and _proc.poll() is None:
+        return True
+    import subprocess
+    env = dict(os.environ)
+    env.setdefault("ACESTEP_API_PORT", UPSTREAM.rsplit(":", 1)[-1])
+    env.setdefault("SERVER_NAME", "127.0.0.1")
+    env.setdefault("ACESTEP_CONFIG_PATH", MODEL)
+    env.setdefault("ACESTEP_INIT_LLM", "false")
+    _log(f"upstream 기동: uv run acestep-api ({MODEL}, LM 없음) @ {ACE_DIR}")
+    _proc = subprocess.Popen(["uv", "run", "acestep-api"], cwd=ACE_DIR, env=env)
+    return True
+
+
+def _kill_upstream(log=print):
+    global _proc
+    _MODEL_READY["ok"] = False
+    if _proc is not None and _proc.poll() is None:
+        _log("upstream 종료 — GPU 를 MF(심사)에 양보")
+        _proc.terminate()
+        try:
+            _proc.wait(timeout=30)
+        except Exception:
+            _proc.kill()
+    _proc = None
+
+
+def _ensure_up(log=print, timeout_s: float = 300) -> bool:
+    """업스트림 살아있음 보장 — 관리 모드면 필요 시 스폰하고 health 를 기다린다."""
+    if _upstream_ok()["ok"]:
+        return True
+    if not _spawn_upstream(log):
+        return False
+    t0 = time.time()
+    while time.time() - t0 < timeout_s:
+        time.sleep(3)
+        if _upstream_ok()["ok"]:
+            return True
+    return False
+
+
+_demucs = None
+
+
+def _separate(wav, phase):
+    """demucs 2-스템 (sa3_server 와 동일 규약) — 스템 완전 자동화의 핵심.
+    사이드카가 없으면 여기서 분리한다. inst = 원본 − vocals (합 보존)."""
+    global _demucs
+    import torch
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+    if _demucs is None:
+        phase("demucs(htdemucs) 로딩")
+        _demucs = get_model("htdemucs")
+        _demucs.to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    phase("보컬/반주 자동 분리 (demucs)")
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    t = torch.from_numpy(wav)[None]
+    ref = t.mean(0)
+    t = (t - ref.mean()) / (ref.std() + 1e-8)
+    with torch.no_grad():
+        srcs = apply_model(_demucs, t.to(dev), device=dev,
+                           split=True, overlap=0.25, progress=False)[0]
+    srcs = srcs * (ref.std() + 1e-8) + ref.mean()
+    vocals = srcs[_demucs.sources.index("vocals")].cpu().numpy()
+    return vocals.astype(np.float32)
+
+
 def _upstream_ok() -> dict:
     try:
         h = requests.get(f"{UPSTREAM}/health", timeout=4).json()
@@ -281,11 +360,11 @@ def _ensure_model(phase=lambda p: None) -> bool:
         _MODEL_READY["ok"] = True
         return True
     phase("ACE 모델 초기화 요청 — 최초엔 다운로드·로드로 수 분")
-    _log(f"/v1/init 호출 (model={MODEL or 'acestep-v15-turbo'}, init_llm=True)")
+    _log(f"/v1/init 호출 (model={MODEL}, init_llm=False — repaint 는 LM 생략)")
     try:
         r = requests.post(f"{UPSTREAM}/v1/init",
-                          json={"model": MODEL or "acestep-v15-turbo",
-                                "init_llm": True}, timeout=1800)
+                          json={"model": MODEL, "init_llm": False},
+                          timeout=1800)
         _log(f"/v1/init 응답: {str(r.text)[:200]}")
     except Exception as e:
         _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
@@ -300,6 +379,10 @@ def _ensure_model(phase=lambda p: None) -> bool:
 
 
 def _boot_watch():
+    # 관리 모드(ACE_DIR)에서는 자동 스폰하지 않는다 — GPU 는 기본적으로 MF 의
+    # 것이고, ACE 는 /load(리터치 시작) 때만 올라온다 (교대 규칙)
+    if ACE_DIR:
+        return
     """기동 도우미 — 업스트림(공식 서버)이 뜰 때까지 기다렸다가 모델 초기화.
     브리지를 먼저 켜도 순서 문제가 없다."""
     for _ in range(360):                # 최대 1시간 (최초 모델 다운로드 감안)
@@ -333,11 +416,20 @@ def _run_job(job: dict):
         # v1.1: 보컬 스템이 오면 SA3 와 같은 구조 — 반주만 repaint 하고 보컬은
         # 원본을 재합성한다. 실측: ACE repaint 는 acs 0.9·가사 전달로도 원본
         # 보컬을 재현하지 못한다(보컬상관 ~0) — 풀믹스 repaint 는 보컬 소실.
+        if not _ensure_up(timeout_s=420):
+            raise RuntimeError("ACE 서버(upstream) 기동 실패 — ace-bridge 창 확인")
+        if not _ensure_model(lambda p: phase(p, 0.04)):
+            raise RuntimeError("ACE 모델 초기화 실패 — ace-bridge 창 확인")
+        # 스템 완전 자동화 — 사이드카(vocals_b64)가 오면 재사용(체인 가속),
+        # 없으면 여기서 demucs 로 자동 분리한다. 사용자는 스템을 몰라도 된다.
         vocals = None
         vb64 = job.pop("vocals_b64", None)
         if vb64:
-            phase("보컬 스템 수신 — 반주만 repaint (보컬 원본 보존)", 0.08)
+            phase("보컬 스템 재사용 — 반주만 repaint (보컬 원본 보존)", 0.08)
             vocals = _decode_wav(vb64)
+        elif job.get("keep_vocals", True):
+            vocals = _separate(wav, lambda p: phase(p, 0.1))
+        if vocals is not None:
             if vocals.shape[1] < wav.shape[1]:
                 vocals = np.concatenate(
                     [vocals, np.zeros((2, wav.shape[1] - vocals.shape[1]),
@@ -358,6 +450,11 @@ def _run_job(job: dict):
                     "repainting_end": e["end_s"],
                     "audio_duration": round(dur, 2)}
             # (thinking 은 repaint 에서 LM 자동 생략 — 공식 문서. 보내지 않는다)
+            if "turbo" not in MODEL:
+                # base 계열: CFG 실동작 — 클라 준수강도(cfg_scale 1.5~3.0)를
+                # 문서 권장 5~9 로 사상. turbo 는 CFG 미사용(자동 1.0 보정).
+                cs = float(e.get("cfg_scale") or 2.0)
+                data["guidance_scale"] = round(min(max(3.0 + cs * 2.0, 4.0), 9.0), 1)
             if e.get("audio_cover_strength") is not None:
                 # 1.0=원본 고수 … 0.1=자유 해석 (공식 문서의 원본 유지 노브)
                 data["audio_cover_strength"] = min(
@@ -475,8 +572,26 @@ def health():
 
 @app.post("/unload")
 def unload():
-    """GPU 중재 호환 — ACE(터보 <4GB)는 MF 와 공존 가능해 no-op."""
-    return {"ok": True, "model_loaded": True, "note": "ace 는 상주 (VRAM 소형)"}
+    """GPU 중재 — XL 모델은 MF 와 공존 불가. 관리 모드에서는 upstream 프로세스를
+    종료해 VRAM 을 완전 해제한다 (공식 unload API 부재의 우회). busy 면 409."""
+    with _lock:
+        if _busy():
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    if not ACE_DIR:
+        return {"ok": True, "model_loaded": True,
+                "note": "비관리 모드 — upstream 을 직접 내릴 수 없음"}
+    _kill_upstream()
+    return {"ok": True, "model_loaded": False}
+
+
+@app.post("/load")
+def load():
+    """리터치 준비 — upstream 기동 + 모델 초기화 (XL 로드 수십 초~수 분)."""
+    if not _ensure_up(timeout_s=420):
+        return JSONResponse(status_code=503, content={"error": "upstream 기동 실패"})
+    if not _ensure_model():
+        return JSONResponse(status_code=503, content={"error": "모델 초기화 실패"})
+    return {"ok": True, "model_loaded": True, "model": MODEL}
 
 
 @app.post("/edit")
@@ -491,6 +606,7 @@ def edit(r: EditReq):
                 "lyrics": e.get("lyrics"),
                 "bpm": e.get("bpm"),
                 "audio_cover_strength": e.get("audio_cover_strength"),
+                "cfg_scale": e.get("cfg_scale"),
                 "label": str(e.get("label") or ""),
             })
         except (TypeError, ValueError):
@@ -502,6 +618,7 @@ def edit(r: EditReq):
     jid = uuid.uuid4().hex
     job = {"id": jid, "status": "queued", "phase": "대기열", "progress": 0.0,
            "created": time.time(), "audio_b64": r.audio_b64, "edits": edits,
+           "vocals_b64": r.vocals_b64, "keep_vocals": r.keep_vocals,
            "seed": r.seed}
     with _lock:
         _jobs[jid] = job
