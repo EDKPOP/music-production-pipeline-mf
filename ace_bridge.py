@@ -241,7 +241,7 @@ def _ace_task(data: dict, src_wav: np.ndarray = None, timeout_s: float = 300,
         if st == 1:
             break
         if st == 2:
-            raise RuntimeError(f"ACE 잡 실패: {str(row)[:300]}")
+            raise RuntimeError(f"ACE 잡 실패: {str(row)[:600]}")
         if time.time() - t0 > timeout_s:
             raise RuntimeError(f"ACE 잡 시간 초과({timeout_s:.0f}s)")
     res = row.get("result")
@@ -272,7 +272,7 @@ def _spawn_upstream(log=print) -> bool:
     env.setdefault("ACESTEP_API_PORT", UPSTREAM.rsplit(":", 1)[-1])
     env.setdefault("SERVER_NAME", "127.0.0.1")
     env.setdefault("ACESTEP_CONFIG_PATH", MODEL)
-    env.setdefault("ACESTEP_INIT_LLM", "false")
+    env.setdefault("ACESTEP_INIT_LLM", "true")   # thinking(repaint 품질 재료)에 필요
     _log(f"upstream 기동: uv run acestep-api ({MODEL}, LM 없음) @ {ACE_DIR}")
     _proc = subprocess.Popen(["uv", "run", "acestep-api"], cwd=ACE_DIR, env=env)
     return True
@@ -361,10 +361,10 @@ def _ensure_model(phase=lambda p: None) -> bool:
         _MODEL_READY["ok"] = True
         return True
     phase("ACE 모델 초기화 요청 — 최초엔 다운로드·로드로 수 분")
-    _log(f"/v1/init 호출 (model={MODEL}, init_llm=False — repaint 는 LM 생략)")
+    _log(f"/v1/init 호출 (model={MODEL}, init_llm=True — thinking 용)")
     try:
         r = requests.post(f"{UPSTREAM}/v1/init",
-                          json={"model": MODEL, "init_llm": False},
+                          json={"model": MODEL, "init_llm": True},
                           timeout=1800)
         _log(f"/v1/init 응답: {str(r.text)[:200]}")
     except Exception as e:
@@ -456,7 +456,11 @@ def _run_job(job: dict):
                     "prompt": e["prompt"],
                     "repainting_start": e["start_s"],
                     "repainting_end": e["end_s"],
-                    "audio_duration": round(dur, 2)}
+                    "audio_duration": round(dur, 2),
+                    # 실측(골든 파일 재현): thinking=true 가 repaint 품질의
+                    # 핵심 재료 — 문서의 'repaint 는 LM 생략' 기술과 달리
+                    # 실제로 관여한다 (없으면 0.052, 있으면 0.039 평탄도)
+                    "thinking": "true"}
             if v_edit:
                 phase(f"{tagp} · 보컬 편집 — 풀믹스 repaint (새 가창)", f0)
                 if e.get("lyrics"):
@@ -469,8 +473,10 @@ def _run_job(job: dict):
                 # 문서 권장 5~9 로 사상. turbo 는 CFG 미사용(자동 1.0 보정).
                 cs = float(e.get("cfg_scale") or 2.0)
                 data["guidance_scale"] = round(min(max(3.0 + cs * 2.0, 4.0), 9.0), 1)
-            if e.get("audio_cover_strength") is not None:
-                # 1.0=원본 고수 … 0.1=자유 해석 (공식 문서의 원본 유지 노브)
+            if (e.get("audio_cover_strength") is not None
+                    and os.environ.get("ACE_SEND_ACS") == "1"):
+                # ⚠ 골든 레시피(품질 승인본)엔 이 인자가 없었다 — 품질 영향
+                # 검증 전까지 기본 미전송 (실험은 ACE_SEND_ACS=1 로)
                 data["audio_cover_strength"] = min(
                     max(float(e["audio_cover_strength"]), 0.05), 1.0)
             if e.get("bpm"):
