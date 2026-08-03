@@ -45,10 +45,11 @@ if errorlevel 1 (
 popd
 
 echo [3/4] ACE 공식 API 서버 시작 - 새 창 "ace-api 8001" (최초 실행 시 모델 자동 다운로드 - 수 GB)
-start "ace-api 8001" /D "%ACEDIR%" cmd /k uv run acestep-api
+rem 래퍼 bat 사용 - 서버가 죽어도 창이 닫히지 않고 오류가 남는다
+start "ace-api 8001" /D "%~dp0" _ace_api.bat "%ACEDIR%"
 
 echo [4/4] 송캠프 브리지 시작 - 새 창 "ace-bridge 8600"
-start "ace-bridge 8600" /D "%~dp0" cmd /k ".venv\Scripts\activate.bat && python ace_bridge.py"
+start "ace-bridge 8600" /D "%~dp0" _ace_bridge.bat
 
 echo.
 echo 확인:  curl http://localhost:8600/health   → upstream 연결까지 최초 수 분
