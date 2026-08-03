@@ -243,6 +243,23 @@ win_amd64 휠 선택 → ③ `pip --no-deps` 설치 → ④ 임포트 재검증�
 - `POST /unload` → 모델 언로드 (잡 진행/대기 중이면 409 busy) · MF 쪽도 동일하게
   `POST /load`·`POST /unload` 지원
 
+## ACE-Step 1.5 리터치 엔진 (선택 — SA3 대체/비교용)
+
+**`run_ace.bat` 더블클릭 한 번**이면: uv 확인 → 저장소 클론(`%USERPROFILE%\ACE-Step-1.5`)
+→ `uv sync` → CUDA torch 검사·복구 → 창 2개 기동:
+- **"ace-api 8001"** — ACE 공식 REST 서버 (최초 실행 시 모델 자동 다운로드, 수 GB)
+- **"ace-bridge 8600"** — 송캠프 계약 통역 (`ace_bridge.py`, MF 레포 .venv 사용)
+
+브리지는 ACE repaint 결과에서 **마스크 구간만** 원본 위에 스플라이스한다
+(마스크 밖 보존을 모델과 무관하게 구조적으로 보장) + 위상 정렬·44.1k 리샘플.
+ACE 터보는 VRAM <4GB 라 **MF 와 공존** — GPU 교대가 필요 없다.
+
+- 확인: `curl http://localhost:8600/health` → `"status":"ok"` (업스트림 연결까지 최초 수 분)
+- 방화벽: 8500 과 같은 방식으로 8600 허용
+- 맥 쪽: 작업실 설정에서 리터치 엔진 **ACE-Step 1.5** 선택 + `http://윈도우IP:8600`
+- 원격 실측: `POST /diag` (자가 테스트 배터리) · `{"raw_task":{...},"src_audio_b64":...}`
+  로 ACE 원 API 패스스루 — 맥의 Claude 가 품질 실험을 원격으로 돌리는 통로
+
 ## 라이선스
 
 코드는 MIT. **Music Flamingo 모델은 NVIDIA OneWay Noncommercial 라이선스**
