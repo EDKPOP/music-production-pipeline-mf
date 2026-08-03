@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v2-arbiter-stems"
+VERSION = "ace-v3-fullmix-stems"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # 모델 선택 — 실측(2026-08-03, 같은 시드·같은 구간)이 문서 티어 권장을 뒤집음:
@@ -151,6 +151,37 @@ def _match_spectrum(gen: np.ndarray, ref: np.ndarray) -> np.ndarray:
     k2 = np.interp(np.linspace(0, 1, spec.shape[1]), np.linspace(0, 1, len(k)), k)
     out = np.fft.irfft(spec * k2, n=gen.shape[1], axis=1)
     return np.ascontiguousarray(out, dtype=np.float32)
+
+
+def _spectral_new(gen: np.ndarray, orig: np.ndarray) -> np.ndarray:
+    """생성물에서 '원본에 없던 성분'만 추출 — overlay(요소 추가)의 핵심.
+    |G|-|O| 정류 후 G 위상으로 복원 (sa3 검증: 추가 성분 120배 우세 추출).
+    repaint 가 구간을 재작곡해버리는 문제를 우회해, 원본 편곡을 그대로 두고
+    캡션의 새 요소만 얹는다."""
+    import numpy as _np
+    n_fft, hop = 2048, 512
+    win = _np.hanning(n_fft).astype(_np.float32)
+    def stft(x):
+        pads = _np.pad(x, (n_fft // 2, n_fft // 2))
+        frames = _np.lib.stride_tricks.sliding_window_view(pads, n_fft)[::hop]
+        return _np.fft.rfft(frames * win, axis=1)
+    out = []
+    for ch in range(gen.shape[0]):
+        G = stft(gen[ch]); O = stft(orig[ch])
+        m = min(G.shape[0], O.shape[0]); G, O = G[:m], O[:m]
+        mag = _np.maximum(_np.abs(G) - _np.abs(O), 0.0)
+        S = mag * _np.exp(1j * _np.angle(G))
+        # overlap-add 역변환
+        y = _np.zeros(m * hop + n_fft, dtype=_np.float32)
+        wsum = _np.zeros_like(y)
+        fr = _np.fft.irfft(S, n=n_fft, axis=1).astype(_np.float32) * win
+        for i in range(m):
+            y[i*hop:i*hop+n_fft] += fr[i]
+            wsum[i*hop:i*hop+n_fft] += win ** 2
+        y = y[n_fft//2:n_fft//2+gen.shape[1]] / _np.maximum(
+            wsum[n_fft//2:n_fft//2+gen.shape[1]], 1e-6)
+        out.append(y[:gen.shape[1]])
+    return _np.stack(out).astype(_np.float32)
 
 
 def _splice(original: np.ndarray, generated: np.ndarray,
@@ -416,123 +447,116 @@ def _run_job(job: dict):
             if not (0 <= s < t <= dur + 0.5):
                 raise ValueError(f"구간이 곡 길이를 벗어남: {s}~{t}s (곡 {dur:.1f}s)")
             e["start_s"], e["end_s"] = s, min(t, dur)
-        # v1.1: 보컬 스템이 오면 SA3 와 같은 구조 — 반주만 repaint 하고 보컬은
-        # 원본을 재합성한다. 실측: ACE repaint 는 acs 0.9·가사 전달로도 원본
-        # 보컬을 재현하지 못한다(보컬상관 ~0) — 풀믹스 repaint 는 보컬 소실.
         if not _ensure_up(timeout_s=420):
             raise RuntimeError("ACE 서버(upstream) 기동 실패 — ace-bridge 창 확인")
         if not _ensure_model(lambda p: phase(p, 0.04)):
             raise RuntimeError("ACE 모델 초기화 실패 — ace-bridge 창 확인")
-        # 스템 완전 자동화 — 사이드카(vocals_b64)가 오면 재사용(체인 가속),
-        # 없으면 여기서 demucs 로 자동 분리한다. 사용자는 스템을 몰라도 된다.
+        # ── v3 아키텍처: 분리는 입력이 아니라 '출력'에서 ──
+        # 모델에는 항상 풀믹스(보컬 포함)를 들려준다 — 곡의 진짜 문맥(보컬
+        # 라인)에 맞춰 작곡하게 하기 위함 (실사고: 분리 반주만 들려주면
+        # '맥락 무시'·보컬 부조화). 보컬 보존은 생성된 구간에서 가짜 보컬을
+        # demucs 로 제거하고 원본 보컬을 되돌려 얹는 방식으로 달성한다.
+        need_preserve = (any(not e.get("vocal_edit") for e in edits)
+                         and job.get("keep_vocals", True))
         vocals = None
         vb64 = job.pop("vocals_b64", None)
-        need_inst = any(not e.get("vocal_edit") for e in edits)
-        if not need_inst:
-            phase("전 예약이 보컬 편집 — 분리 생략, 풀믹스 repaint", 0.08)
-        elif vb64:
-            phase("보컬 스템 재사용 — 반주만 repaint (보컬 원본 보존)", 0.08)
-            vocals = _decode_wav(vb64)
-        elif job.get("keep_vocals", True):
-            vocals = _separate(wav, lambda p: phase(p, 0.1))
-        if vocals is not None:
+        if need_preserve:
+            if vb64:
+                phase("원본 보컬 스템 재사용", 0.08)
+                vocals = _decode_wav(vb64)
+            else:
+                vocals = _separate(wav, lambda p: phase("원본 " + p, 0.1))
             if vocals.shape[1] < wav.shape[1]:
                 vocals = np.concatenate(
                     [vocals, np.zeros((2, wav.shape[1] - vocals.shape[1]),
                                       np.float32)], axis=1)
             vocals = np.ascontiguousarray(vocals[:, :wav.shape[1]])
-            work = wav - vocals              # 반주 = 믹스 − 보컬 (합 보존)
-        else:
-            work = wav
-        cur = work.copy()               # 반주(또는 보컬 없는 경우 믹스) 타임라인
-        mix_cur = wav.copy()            # 풀믹스 타임라인 — vocal_edit 결과 누적
+        mix_cur = wav.copy()
         vocal_edited = False
         total = len(edits)
         for i, e in enumerate(edits):
             f0 = 0.15 + 0.75 * i / total
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
-            phase(f"{tagp} · ACE repaint {e['start_s']:.1f}~{e['end_s']:.1f}s", f0)
             v_edit = bool(e.get("vocal_edit"))
-            src_buf = mix_cur if v_edit else cur
-            data = {"task_type": "repaint",
-                    "prompt": e["prompt"],
+            mode_e = (e.get("mode") or "repaint").lower()
+            phase(f"{tagp} · ACE repaint(풀믹스 문맥) "
+                  f"{e['start_s']:.1f}~{e['end_s']:.1f}s", f0)
+            data = {"task_type": "repaint", "prompt": e["prompt"],
                     "repainting_start": e["start_s"],
                     "repainting_end": e["end_s"],
-                    "audio_duration": round(dur, 2),
-                    # 실측(골든 파일 재현): thinking=true 가 repaint 품질의
-                    # 핵심 재료 — 문서의 'repaint 는 LM 생략' 기술과 달리
-                    # 실제로 관여한다 (없으면 0.052, 있으면 0.039 평탄도)
-                    "thinking": "true"}
+                    "audio_duration": round(dur, 2)}
             if v_edit:
-                phase(f"{tagp} · 보컬 편집 — 풀믹스 repaint (새 가창)", f0)
                 if e.get("lyrics"):
                     data["lyrics"] = e["lyrics"]
                 if e.get("vocal_language"):
                     data["vocal_language"] = e["vocal_language"]
-            # (thinking 은 repaint 에서 LM 자동 생략 — 공식 문서. 보내지 않는다)
             if "turbo" not in MODEL:
-                # base 계열: CFG 실동작 — 클라 준수강도(cfg_scale 1.5~3.0)를
-                # 문서 권장 5~9 로 사상. turbo 는 CFG 미사용(자동 1.0 보정).
                 cs = float(e.get("cfg_scale") or 2.0)
                 data["guidance_scale"] = round(min(max(3.0 + cs * 2.0, 4.0), 9.0), 1)
-            if (e.get("audio_cover_strength") is not None
-                    and os.environ.get("ACE_SEND_ACS") == "1"):
-                # ⚠ 골든 레시피(품질 승인본)엔 이 인자가 없었다 — 품질 영향
-                # 검증 전까지 기본 미전송 (실험은 ACE_SEND_ACS=1 로)
-                data["audio_cover_strength"] = min(
-                    max(float(e["audio_cover_strength"]), 0.05), 1.0)
             if e.get("bpm"):
                 data["bpm"] = int(float(e["bpm"]))
             if job.get("seed") is not None:
                 data["seed"] = int(job["seed"])
                 data["use_random_seed"] = "false"
-            if e.get("lyrics"):
-                data["lyrics"] = e["lyrics"]
-            gen = _ace_task(data, src_wav=src_buf,
+            gen = _ace_task(data, src_wav=mix_cur,
                             phase=lambda p: phase(f"{tagp} · {p}", f0))
-            # 길이 정렬 → 위상 정렬 → 마스크만 스플라이스 (원본 보존 보장)
-            if gen.shape[1] < src_buf.shape[1]:
-                gen = np.concatenate(
-                    [gen, src_buf[:, gen.shape[1]:]], axis=1)
-            gen = gen[:, : src_buf.shape[1]]
-            a, b = int(e["start_s"] * SR), int(e["end_s"] * SR)
-            gen, lag = _phase_align(gen, src_buf, a, b)
+            if gen.shape[1] < mix_cur.shape[1]:
+                gen = np.concatenate([gen, mix_cur[:, gen.shape[1]:]], axis=1)
+            gen = gen[:, : mix_cur.shape[1]]
+            a = int(e["start_s"] * SR)
+            b = min(int(e["end_s"] * SR), mix_cur.shape[1])
+            gen, lag = _phase_align(gen, mix_cur, a, b)
             if lag:
                 _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
-            # 마스크 구간만 EQ 매칭 (ACE 어두움 보정) 후 스플라이스
-            fixed = _match_spectrum(gen[:, a:b], src_buf[:, a:b])
-            gen = gen.copy()
-            gen[:, a:a + fixed.shape[1]] = fixed
             if v_edit:
+                # 보컬 편집 — 생성 풀믹스(새 가창)를 그대로 채택
+                fixed = _match_spectrum(gen[:, a:b], mix_cur[:, a:b])
+                gen = gen.copy()
+                gen[:, a:a + fixed.shape[1]] = fixed
                 mix_cur = _splice(mix_cur, gen, e["start_s"], e["end_s"])
                 vocal_edited = True
+                continue
+            # 반주 경로 — 생성 구간에서 '가짜 보컬'을 분리 제거
+            gen_reg = np.ascontiguousarray(gen[:, a:b])
+            if vocals is not None:
+                gen_voc = _separate(
+                    gen_reg, lambda p: phase(f"{tagp} · 생성 구간 {p}", f0))
+                gen_inst = gen_reg - gen_voc
             else:
-                cur = _splice(cur, gen, e["start_s"], e["end_s"])
-        if vocals is not None:
-            # 반주 편집 구간을 풀믹스 타임라인에 재합성 (보컬 게이트).
-            # vocal_edit 구간은 이미 mix_cur 에 반영되어 건드리지 않는다.
-            phase("보컬 재합성", 0.9)
-            mixed = cur + vocals
-            for e in edits:
-                if e.get("vocal_edit"):
+                gen_inst = gen_reg
+            if mode_e == "overlay":
+                # 요소 추가 — 원본에 없던 성분만 추출해 기존 믹스 위에 합성
+                elem = _spectral_new(gen_inst, mix_cur[:, a:b])
+                ref_rms = float(np.sqrt(np.mean(mix_cur[:, a:b] ** 2))) or 1e-4
+                e_rms = float(np.sqrt(np.mean(elem ** 2)))
+                if e_rms < 0.02 * ref_rms:
+                    _log("  overlay: 추가 성분 미미 — 건너뜀")
                     continue
-                a, b = int(e["start_s"] * SR), min(int(e["end_s"] * SR),
-                                                   wav.shape[1])
-                v_rms = float(np.sqrt(np.mean(vocals[:, a:b] ** 2))) if b > a else 0.0
-                m_rms = float(np.sqrt(np.mean(wav[:, a:b] ** 2))) if b > a else 0.0
-                layer = mixed
-                if v_rms < max(1e-3, 0.05 * m_rms):
-                    layer = cur
-                    _log(f"  보컬 게이트: {e['start_s']:.1f}~{e['end_s']:.1f}s "
-                         "보컬 미검출 — 반주만 합성")
-                mix_cur = _splice(mix_cur, layer, e["start_s"], e["end_s"])
-            cur = mix_cur
-        elif vocal_edited:
-            # 분리 없는 잡(전부 보컬 편집 또는 keep_vocals=false) —
-            # 보컬 편집 구간만 풀믹스 결과를 반영
-            for e in edits:
-                if e.get("vocal_edit"):
-                    cur = _splice(cur, mix_cur, e["start_s"], e["end_s"])
+                lvl = min(max(float(e.get("strength") or 0.4), 0.15), 0.9)
+                elem *= (ref_rms / max(e_rms, 0.05 * ref_rms)) * lvl * 1.2
+                xf0 = int(0.03 * SR)
+                if elem.shape[1] > 2 * xf0:
+                    r0 = np.linspace(0.0, 1.0, xf0, dtype=np.float32)
+                    elem[:, :xf0] *= r0
+                    elem[:, -xf0:] *= r0[::-1]
+                mix_cur = mix_cur.copy()
+                mix_cur[:, a:a + elem.shape[1]] += elem
+                _log(f"  overlay: 요소만 합성 ×{lvl * 1.2:.2f} (기존 편곡 무변경)")
+                continue
+            # repaint(재작곡) — 새 반주 + 원본 보컬 재합성 (보컬 게이트)
+            if vocals is not None:
+                orig_inst_reg = wav[:, a:b] - vocals[:, a:b]
+                gen_inst = _match_spectrum(gen_inst, orig_inst_reg)
+                v_rms = float(np.sqrt(np.mean(vocals[:, a:b] ** 2)))
+                m_rms = float(np.sqrt(np.mean(wav[:, a:b] ** 2)))
+                region = (gen_inst if v_rms < max(1e-3, 0.05 * m_rms)
+                          else gen_inst + vocals[:, a:b])
+            else:
+                region = _match_spectrum(gen_inst, wav[:, a:b])
+            gen_full = gen.copy()
+            gen_full[:, a:a + (b - a)] = region[:, : b - a]
+            mix_cur = _splice(mix_cur, gen_full, e["start_s"], e["end_s"])
+        cur = mix_cur
         peak = float(np.abs(cur).max() or 1.0)
         if peak > 1.0:
             cur = cur / peak * 0.999
@@ -642,6 +666,8 @@ def edit(r: EditReq):
                 "bpm": e.get("bpm"),
                 "audio_cover_strength": e.get("audio_cover_strength"),
                 "cfg_scale": e.get("cfg_scale"),
+                "mode": str(e.get("mode") or "repaint"),
+                "strength": e.get("strength"),
                 "vocal_edit": bool(e.get("vocal_edit")),
                 "vocal_language": e.get("vocal_language"),
                 "label": str(e.get("label") or ""),
