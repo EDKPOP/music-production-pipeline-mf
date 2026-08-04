@@ -191,23 +191,62 @@ def _separate_4(wav, phase):
 
 
 # ── SAO-Instruct 모델 ─────────────────────────────────────────────
+_LOAD_ERR = {"err": ""}
+
+
+def _strip_ckpt_paths(node):
+    """config 내 pretransform_ckpt_path 참조 제거 — HF 레포에 없는
+    vae_model.ckpt 를 열려다 죽는 것을 막는다 (가중치는 model.pt 에 포함)."""
+    if isinstance(node, dict):
+        node.pop("pretransform_ckpt_path", None)
+        for v in node.values():
+            _strip_ckpt_paths(v)
+    elif isinstance(node, list):
+        for v in node:
+            _strip_ckpt_paths(v)
+
+
 def _load_model(phase=lambda p: None) -> bool:
     global _model
     if MOCK or _model is not None:
         return True
     if SAO_DIR and SAO_DIR not in sys.path:
         sys.path.insert(0, SAO_DIR)
+    import json as _json
     try:
         import torch
         from model.sao_instruct import SAOInstruct
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
         phase("SAO-Instruct 모델 로드 (최초엔 HF 다운로드 수 분)")
         _log(f"모델 로드: {HF_ID}")
-        dev = "cuda" if torch.cuda.is_available() else "cpu"
-        _model = SAOInstruct.from_pretrained(HF_ID).eval().to(dev)
+        m = None
+        try:                        # 경로 1 — 공식 README 방식
+            m = SAOInstruct.from_pretrained(HF_ID)
+        except Exception as e1:
+            _log(f"from_pretrained 실패({type(e1).__name__}: {str(e1)[:200]}) "
+                 "— 수동 로드 폴백")
+            # 경로 2 — HF 레포 실구조(config.json=아키텍처, model.pt=가중치)에
+            # 맞춘 수동 조립: mixin 표준(model.safetensors)이 아니라서
+            # from_pretrained 가 깨질 수 있다
+            from huggingface_hub import hf_hub_download
+            cfg_p = hf_hub_download(HF_ID, "config.json")
+            ckpt_p = hf_hub_download(HF_ID, "model.pt")
+            mc = _json.load(open(cfg_p, encoding="utf-8"))
+            _strip_ckpt_paths(mc)
+            patched = os.path.join(tempfile.gettempdir(), "sao_cfg_patched.json")
+            _json.dump(mc, open(patched, "w", encoding="utf-8"))
+            m = SAOInstruct(config_path=patched, checkpoint_path=ckpt_p)
+        m = m.eval().to(dev)
+        if not hasattr(m, "device"):
+            m.device = dev          # edit_audio 가 self.device 를 참조
+        _model = m
+        _LOAD_ERR["err"] = ""
         _log("모델 준비 완료")
         return True
     except Exception as e:
-        _log(f"모델 로드 실패: {type(e).__name__}: {e}")
+        _LOAD_ERR["err"] = (f"{type(e).__name__}: {str(e)[:400]}\n"
+                            + traceback.format_exc(limit=4))
+        _log(f"모델 로드 실패: {_LOAD_ERR['err']}")
         return False
 
 
@@ -389,6 +428,7 @@ def health():
         pass
     return {"status": "ok", "version": VERSION, "cuda": cuda or MOCK,
             "model_loaded": MOCK or _model is not None,
+            "load_error": _LOAD_ERR["err"][:600],
             "max_audio_s": 600.0, "busy": _busy(),
             "modes": ["stem_edit", "edit"],
             "flash_attn": True, "flash_attn_info": "(sao)",
@@ -400,7 +440,8 @@ def health():
 @app.post("/load")
 def load():
     if not _load_model():
-        return JSONResponse(status_code=503, content={"error": "모델 로드 실패"})
+        return JSONResponse(status_code=503, content={
+            "error": "모델 로드 실패", "detail": _LOAD_ERR["err"][:1200]})
     return {"ok": True, "model_loaded": True}
 
 
