@@ -26,11 +26,16 @@ if defined SA3DIR (
   echo      탐색한 경로: ..\stable-audio-3 / .\stable-audio-3 / %USERPROFILE%\stable-audio-3
 )
 echo.
-echo [3/3] ACE-Step 1.5 리터치 엔진 - 환경 확인 후 두 창으로 기동
+echo [3/4] ACE-Step 1.5 리터치 엔진 - 환경 확인 후 두 창으로 기동
 call "%~dp0_ace_start.bat"
 if errorlevel 1 echo      X ACE 시동 실패 - 위 오류 확인 ^(MF/SA3 는 영향 없음^)
 
 echo.
-echo 상태 확인:  http://localhost:8400/health   http://localhost:8500/health   http://localhost:8600/health
+echo [4/4] SAO-Instruct 편집 서버 - 환경 확인 후 기동 ^(악기/음색 교체 전용^)
+call "%~dp0_sao_start.bat"
+if errorlevel 1 echo      X SAO 시동 실패 - 위 오류 확인 ^(다른 서버는 영향 없음^)
+
+echo.
+echo 상태 확인:  http://localhost:8400/health   http://localhost:8500/health   http://localhost:8600/health   http://localhost:8700/health
 echo 이 창은 닫아도 됩니다 - 서버는 각자의 창에서 돕니다.
 pause

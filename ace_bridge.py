@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v3-fullmix-stems"
+VERSION = "ace-v4-stemroute"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # 모델 선택 — 실측(2026-08-03, 같은 시드·같은 구간)이 문서 티어 권장을 뒤집음:
@@ -365,6 +365,114 @@ def _separate(wav, phase):
     return vocals.astype(np.float32)
 
 
+def _separate_4(wav, phase):
+    """demucs htdemucs 4스템 분리 — 드럼 스템 경로(stem_repaint)용.
+
+    실측(2026-08-04): ACE 에 드럼 스템만 들려주고 repaint 하면 스템 순수성
+    99%·밝기 4.6kHz(전 경로 중 최고) — 반면 멜로디 스템(other)은 드럼·베이스를
+    33~46% 멋대로 채워 넣는다. 그래서 이 경로는 기본적으로 drums 전용이다."""
+    global _demucs
+    import torch
+    from demucs.apply import apply_model
+    from demucs.pretrained import get_model
+    if _demucs is None:
+        phase("demucs(htdemucs) 로딩")
+        _demucs = get_model("htdemucs")
+        _demucs.to("cuda" if torch.cuda.is_available() else "cpu").eval()
+    phase("4스템 자동 분리 (demucs)")
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    t = torch.from_numpy(wav)[None]
+    ref = t.mean(0)
+    t = (t - ref.mean()) / (ref.std() + 1e-8)
+    with torch.no_grad():
+        srcs = apply_model(_demucs, t.to(dev), device=dev,
+                           split=True, overlap=0.25, progress=False)[0]
+    srcs = srcs * (ref.std() + 1e-8) + ref.mean()
+    out = {}
+    for i, name in enumerate(_demucs.sources):
+        st = srcs[i].cpu().numpy().astype(np.float32)
+        if st.shape[1] < wav.shape[1]:
+            st = np.concatenate(
+                [st, np.zeros((2, wav.shape[1] - st.shape[1]), np.float32)],
+                axis=1)
+        out[name] = np.ascontiguousarray(st[:, :wav.shape[1]])
+    return out
+
+
+def _rolloff(x, q=0.95) -> float:
+    """rolloff95(Hz) — 밝기 게이트의 단일 계기. 원곡 실측 기준 ~7.8kHz."""
+    m = x.mean(axis=0) if x.ndim == 2 else x
+    if m.shape[-1] < 4096:
+        return 0.0
+    S = np.abs(np.fft.rfft(m)) ** 2
+    f = np.fft.rfftfreq(m.shape[-1], 1.0 / SR)
+    c = np.cumsum(S)
+    if c[-1] <= 0:
+        return 0.0
+    return float(f[min(int(np.searchsorted(c, q * c[-1])), len(f) - 1)])
+
+
+def _stem_repaint(e, mix_cur, cache, job, phase, tagp, f0):
+    """의도 ①(리듬 변경)·②(필인) 경로 — 드럼 스템만 ACE repaint.
+
+    재합성은 mix - 원본스템 + 새스템 (선형 차감) — 분리 잔차까지 포함해
+    나머지 성분이 수학적으로 1샘플도 안 바뀐다. 스템 캐시는 mix_cur 가
+    다른 모드로 변형되는 순간 무효화된다."""
+    stem_name = str(e.get("stem") or "drums").lower()
+    if stem_name != "drums":
+        _log(f"  ⚠ stem_repaint({stem_name}) — drums 외 스템은 순수성 미보장"
+             " (실측: other 스템은 33~46% 오염)")
+    if cache.get("stems") is None:
+        cache["stems"] = _separate_4(
+            mix_cur, lambda p: phase(f"{tagp} · {p}", f0))
+    stems = cache["stems"]
+    if stem_name not in stems:
+        raise ValueError(f"알 수 없는 스템: {stem_name}")
+    st = stems[stem_name]
+    a = int(e["start_s"] * SR)
+    b = min(int(e["end_s"] * SR), mix_cur.shape[1])
+    data = {"task_type": "repaint", "prompt": e["prompt"],
+            "repainting_start": e["start_s"], "repainting_end": e["end_s"],
+            "audio_duration": round(mix_cur.shape[1] / SR, 2)}
+    if e.get("bpm"):
+        data["bpm"] = int(float(e["bpm"]))
+    if job.get("seed") is not None:
+        data["seed"] = int(job["seed"])
+        data["use_random_seed"] = "false"
+    phase(f"{tagp} · ACE {stem_name} 스템 repaint "
+          f"{e['start_s']:.1f}~{e['end_s']:.1f}s", f0)
+    gen = _ace_task(data, src_wav=st, phase=lambda p: phase(f"{tagp} · {p}", f0))
+    if gen.shape[1] < st.shape[1]:
+        gen = np.concatenate(
+            [gen, st[:, gen.shape[1]:]], axis=1)
+    gen = gen[:, : st.shape[1]]
+    gen, lag = _phase_align(gen, st, a, b)
+    if lag:
+        _log(f"  위상 정렬: {lag * 1000.0 / SR:+.0f}ms")
+    reg = np.ascontiguousarray(gen[:, a:b])
+    orig_reg = st[:, a:b]
+    reg = _match_spectrum(reg, orig_reg)
+    # 레벨 매칭 — 원본 스템 구간이 사실상 무음(필인 삽입)이면 믹스 기준 폴백
+    r_orig = float(np.sqrt(np.mean(orig_reg ** 2)))
+    r_mix = float(np.sqrt(np.mean(mix_cur[:, a:b] ** 2))) or 1e-4
+    r_gen = float(np.sqrt(np.mean(reg ** 2)))
+    target = r_orig if r_orig > 0.05 * r_mix else 0.45 * r_mix
+    if r_gen > 1e-6:
+        reg = reg * min(target / r_gen, 4.0)
+    gen_full = st.copy()
+    gen_full[:, a:a + reg.shape[1]] = reg
+    new_st = _splice(st, gen_full, e["start_s"], e["end_s"])
+    ro_o, ro_g = _rolloff(orig_reg), _rolloff(new_st[:, a:b])
+    gate = {"label": e.get("label") or "", "stem": stem_name,
+            "rolloff_orig": round(ro_o), "rolloff_gen": round(ro_g)}
+    job.setdefault("gate", []).append(gate)
+    _log(f"  밝기 게이트: 원본스템 {ro_o:.0f}Hz → 생성 {ro_g:.0f}Hz"
+         + (" ⚠ 어두움" if ro_o > 0 and ro_g < 0.5 * ro_o else ""))
+    mix_new = mix_cur - st + new_st
+    cache["stems"][stem_name] = new_st
+    return np.ascontiguousarray(mix_new, dtype=np.float32)
+
+
 def _upstream_ok() -> dict:
     try:
         h = requests.get(f"{UPSTREAM}/health", timeout=4).json()
@@ -456,7 +564,9 @@ def _run_job(job: dict):
         # 라인)에 맞춰 작곡하게 하기 위함 (실사고: 분리 반주만 들려주면
         # '맥락 무시'·보컬 부조화). 보컬 보존은 생성된 구간에서 가짜 보컬을
         # demucs 로 제거하고 원본 보컬을 되돌려 얹는 방식으로 달성한다.
-        need_preserve = (any(not e.get("vocal_edit") for e in edits)
+        need_preserve = (any(not e.get("vocal_edit")
+                             and (e.get("mode") or "repaint").lower()
+                             != "stem_repaint" for e in edits)
                          and job.get("keep_vocals", True))
         vocals = None
         vb64 = job.pop("vocals_b64", None)
@@ -474,11 +584,17 @@ def _run_job(job: dict):
         mix_cur = wav.copy()
         vocal_edited = False
         total = len(edits)
+        stem_cache = {"stems": None}   # mix_cur 기준 4스템 — 타 모드가 변형하면 무효
         for i, e in enumerate(edits):
             f0 = 0.15 + 0.75 * i / total
             tagp = f"{i+1}/{total} {e.get('label') or ''}".strip()
             v_edit = bool(e.get("vocal_edit"))
             mode_e = (e.get("mode") or "repaint").lower()
+            if mode_e == "stem_repaint" and not v_edit:
+                mix_cur = _stem_repaint(e, mix_cur, stem_cache, job,
+                                        phase, tagp, f0)
+                continue
+            stem_cache["stems"] = None
             phase(f"{tagp} · ACE repaint(풀믹스 문맥) "
                   f"{e['start_s']:.1f}~{e['end_s']:.1f}s", f0)
             data = {"task_type": "repaint", "prompt": e["prompt"],
@@ -553,6 +669,12 @@ def _run_job(job: dict):
                           else gen_inst + vocals[:, a:b])
             else:
                 region = _match_spectrum(gen_inst, wav[:, a:b])
+            ro_o, ro_g = _rolloff(wav[:, a:b]), _rolloff(region)
+            job.setdefault("gate", []).append(
+                {"label": e.get("label") or "", "stem": None,
+                 "rolloff_orig": round(ro_o), "rolloff_gen": round(ro_g)})
+            _log(f"  밝기 게이트: 원본 {ro_o:.0f}Hz → 생성 {ro_g:.0f}Hz"
+                 + (" ⚠ 어두움" if ro_o > 0 and ro_g < 0.5 * ro_o else ""))
             gen_full = gen.copy()
             gen_full[:, a:a + (b - a)] = region[:, : b - a]
             mix_cur = _splice(mix_cur, gen_full, e["start_s"], e["end_s"])
@@ -621,7 +743,8 @@ def health():
             "model_loaded": bool(models),
             "ace_models": [m.get("name") for m in models if isinstance(m, dict)],
             "max_audio_s": MAX_AUDIO_S,
-            "busy": _busy(), "modes": ["inpaint", "a2a", "overlay", "repaint"],
+            "busy": _busy(),
+            "modes": ["inpaint", "a2a", "overlay", "repaint", "stem_repaint"],
             "flash_attn": True, "flash_attn_info": "(ace)",
             "engine": "ace-step-1.5", "upstream": UPSTREAM,
             "upstream_detail": up["detail"],
@@ -667,6 +790,7 @@ def edit(r: EditReq):
                 "audio_cover_strength": e.get("audio_cover_strength"),
                 "cfg_scale": e.get("cfg_scale"),
                 "mode": str(e.get("mode") or "repaint"),
+                "stem": e.get("stem"),
                 "strength": e.get("strength"),
                 "vocal_edit": bool(e.get("vocal_edit")),
                 "vocal_language": e.get("vocal_language"),
@@ -696,7 +820,7 @@ def job_status(jid: str):
     if not j:
         return JSONResponse(status_code=404, content={"detail": "job not found"})
     return {k: j.get(k) for k in
-            ("id", "status", "phase", "progress", "error", "elapsed_s")}
+            ("id", "status", "phase", "progress", "error", "elapsed_s", "gate")}
 
 
 @app.get("/jobs/{jid}/result")

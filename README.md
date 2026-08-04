@@ -265,8 +265,29 @@ v2 구조 (2026-08-03):
 - 원격 실측: `POST /diag` (자가 테스트 배터리) · `{"raw_task":{...},"src_audio_b64":...}`
   로 ACE 원 API 패스스루 — 맥의 Claude 가 품질 실험을 원격으로 돌리는 통로
 
+## SAO-Instruct 편집 서버 (선택 — 악기·음색 교체 전용, 8700)
+
+**`run.bat` [4/4] 단계로 함께 기동**된다 (수동은 `_sao_start.bat`):
+uv 확인 → `sao-instruct` 클론(ETH-DISCO) → venv(py3.10)+의존성 →
+CUDA 복구 → 모델 웨이트 선다운로드(HF `disco-eth/sao-instruct`) →
+**"sao-server 8700" 창 하나**.
+
+왜 별도 서버인가 (2026-08-04 재설계 — 맥 레포 docs/retouch_workflow_redesign.md):
+- ACE repaint 는 구간 '재작곡'이라 "신스만 통기타로, 나머지 유지" 같은
+  외과적 교체가 안 된다 (실측: 멜로디 스템 순수성 33~46% 오염)
+- SAO-Instruct 는 Stable Audio Open(44.1kHz) 위 자연어 지시 편집 —
+  원본에서 출발하므로 보존 성향 유리 (NeurIPS 2025, 웨이트 공개)
+- 전략: 마스크 ±8s 창(≤45s) → demucs 4스템 분리 → **대상 스템만 편집**
+  → 창믹스−원본스템+새스템 재합성 (나머지 성분 1:1 보존) → 스플라이스
+
+- 확인: `curl http://localhost:8700/health` → `"status":"ok"`
+- GPU 교대: /load /unload — 맥 중재자가 MF·ACE·SA3 와 자동 교대
+- 원격 실측: `POST /diag` `{"instruction":..,"audio_b64":..,"stem":"other"}`
+- 모의 검증: `SAO_MOCK=1` 로 모델 없이 수명주기·재합성 수학 검증 가능
+
 ## 라이선스
 
 코드는 MIT. **Music Flamingo 모델은 NVIDIA OneWay Noncommercial 라이선스**
 (비상업 연구 용도 전용), **Stable Audio 3 는 Stability AI Community License**
+(비상업 OK), **SAO-Instruct 도 Stability AI Community License 계열**
 (비상업 OK)입니다 — 이 프로젝트는 비상업 개인 프로듀싱 용도로만 쓰세요.
