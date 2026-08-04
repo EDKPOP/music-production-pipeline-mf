@@ -276,15 +276,21 @@ def _edit_clip(wav, instruction, cfg, noise, phase):
         t = np.arange(wav.shape[1]) / SR
         return (wav * 0.9
                 + 0.1 * np.sin(2 * np.pi * 880 * t)[None, :]).astype(np.float32)
-    import soundfile as sf
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "win.wav")
-        sf.write(p, wav.T, SR)
-        phase("SAO-Instruct 편집 추론")
+    import torch
+    import model.sao_instruct as _MSI
+    phase("SAO-Instruct 편집 추론")
+    # torchaudio 2.8 의 ta.load 는 torchcodec 를 요구(윈도우 미설치) —
+    # 우리는 배열을 이미 갖고 있으니 그들의 파일 로더를 우회한다
+    _orig_load = _MSI.ta.load
+    _MSI.ta.load = lambda p, *a, **k: (torch.from_numpy(
+        np.ascontiguousarray(wav)), SR)
+    try:
         clips = _model.edit_audio(
-            instructions=[str(instruction)], audio_path=p,
+            instructions=[str(instruction)], audio_path="<in-memory>",
             encode_audio=True, cfg_scale=float(cfg),
             encoded_audio_noise=float(noise))
+    finally:
+        _MSI.ta.load = _orig_load
     c = clips[0]
     try:
         c = c.detach().cpu().numpy()
