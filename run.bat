@@ -16,7 +16,7 @@ if exist "%USERPROFILE%\stable-audio-3\.venv\Scripts\activate.bat" set "SA3DIR=%
 
 if defined SA3DIR (
   echo [2/2] SA3 리터치 서버 시작 - 새 창 "sa3-server 8500"  ^(환경: %SA3DIR%\.venv^)
-  start "sa3-server 8500" cmd /k call "%SA3DIR%\.venv\Scripts\activate.bat" ^&^& python sa3_server.py
+  start "sa3-server 8500" cmd /k "%~dp0_sa3_run.bat"
 ) else (
   echo.
   echo [2/2] X SA3 리터치 서버^(8500^)는 켜지 못했습니다 - stable-audio-3 미설치.

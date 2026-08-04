@@ -57,7 +57,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-VERSION = "sa3-v4.6-eqmatch"
+VERSION = "sa3-v5-audedit"
 SR = 44100
 A2A_CTX_S = 10.0         # a2a(변형) 창: 구간 ± 문맥 초 — 짧을수록 충실도·속도↑
 # inpaint(재생성)도 전곡이 아니라 구간 ± 문맥 창만 모델에 보낸다 — SA3 논문의
@@ -665,11 +665,154 @@ def health():
     return {"status": "ok", "version": VERSION, "cuda": _cuda(),
             "model_loaded": _sa3 is not None, "max_audio_s": MAX_AUDIO_S,
             "busy": _busy(),
-            "modes": ["inpaint", "a2a", "overlay"],   # 클라이언트 기능 게이트
+            "modes": ["inpaint", "a2a", "overlay", "audedit"],   # 클라이언트 기능 게이트
             "flash_attn": fa["ok"],
             "flash_attn_info": fa.get("version") or fa.get("error", ""),
             "queue": len(_queue) + sum(1 for j in _jobs.values()
                                        if j["status"] == "running")}
+
+
+def _audedit_run(wav_np, c_tar, c_src, steps=28, n_skip_head=4,
+                 n_skip_tail=0, w_src=1.5, w_tar=3.5, n_avg=1, seed=7,
+                 apg=0.0, log=lambda p: None):
+    """AudEdit (arXiv 2606.15149) — inversion-free 텍스트 편집.
+
+    원본 라텐트에서 출발해, 매 스텝 target/source 조건 속도장의 '차이'만
+    적분한다 (식 15~20). 학습·최적화·어텐션 접근 불필요 — SA3 medium 의
+    속도장을 스텝당 2회 평가할 뿐이다.
+      ẑ_src = (1-t)·x_src + t·ε          (공유 노이즈)
+      ẑ_tar = z_edit + ẑ_src - x_src
+      z_edit ← z_edit + (t_next-t)·[V_cfg(ẑ_tar,t,c_tar) - V_cfg(ẑ_src,t,c_src)]
+    n_skip_head = 고노이즈 스텝 생략 수 (논문 T-n_max: 클수록 보존↑ 편집↓).
+    """
+    import torch
+    from stable_audio_3.inference.sampling import build_schedule
+    M = _load_sa3()
+    core = M.model                        # ConditionedDiffusionModelWrapper
+    dev = "cuda" if _cuda() else "cpu"
+    dur = wav_np.shape[1] / SR
+    pt = core.pretransform
+    ratio = pt.downsampling_ratio
+    n = wav_np.shape[1]
+    pad = (-n) % ratio
+    audio = torch.from_numpy(np.pad(wav_np, ((0, 0), (0, pad))))
+    pt_dtype = next(pt.parameters()).dtype
+    with torch.no_grad():
+        z = pt.encode(audio[None].to(dev).to(pt_dtype))
+    Tlat = z.shape[-1]
+    dit = core.model
+    dtype = next(dit.parameters()).dtype
+    z = z.to(dtype)
+
+    def cond_inputs(prompt):
+        ct = core.conditioner([{"prompt": str(prompt),
+                                "seconds_total": dur}], dev)
+        ct["inpaint_mask"] = [torch.zeros((1, 1, Tlat), device=dev)]
+        ct["inpaint_masked_input"] = [
+            torch.zeros((1, core.io_channels, Tlat), device=dev)]
+        ci = core.get_conditioning_inputs(ct)
+        return {k: (v.type(dtype) if v is not None and hasattr(v, "type")
+                    else v) for k, v in ci.items()}
+
+    with torch.no_grad():
+        ci_tar = cond_inputs(c_tar)
+        ci_src = cond_inputs(c_src or "")
+        sched = build_schedule(steps=steps, sigma_max=1.0,
+                               dist_shift=core.sampling_dist_shift,
+                               fallback_seq_len=Tlat, include_endpoint=True,
+                               device=dev)
+        sched = sched.flatten().tolist()
+        if seed is not None:
+            torch.manual_seed(int(seed))
+        z_edit = z.clone()
+        for i in range(steps):
+            t_i, t_n = float(sched[i]), float(sched[i + 1])
+            if i < n_skip_head or i >= steps - n_skip_tail:
+                continue
+            acc = None
+            for _ in range(max(1, int(n_avg))):
+                eps = torch.randn_like(z)
+                z_src = (1.0 - t_i) * z + t_i * eps
+                z_tar = z_edit + z_src - z
+                tt = torch.full((1,), t_i, device=dev, dtype=dtype)
+                v_t = dit(z_tar, tt, cfg_scale=float(w_tar), batch_cfg=True,
+                          rescale_cfg=False, apg_scale=float(apg), **ci_tar)
+                v_s = dit(z_src, tt, cfg_scale=float(w_src), batch_cfg=True,
+                          rescale_cfg=False, apg_scale=float(apg), **ci_src)
+                d = v_t - v_s
+                acc = d if acc is None else acc + d
+            z_edit = z_edit + (t_n - t_i) * (acc / max(1, int(n_avg)))
+            if i % 4 == 0:
+                log(f"AudEdit {i + 1}/{steps}")
+        out = pt.decode(z_edit.to(pt_dtype))
+    out = out.float().cpu().numpy()
+    if out.ndim == 3:
+        out = out[0]
+    return np.ascontiguousarray(out[:, :n], dtype=np.float32)
+
+
+class AudEditReq(BaseModel):
+    audio_b64: str
+    target_prompt: str
+    source_prompt: str = ""      # 논문: 빈 문자열도 동등 성능 (표11)
+    steps: int = 28
+    n_skip_head: int = 4         # = T - n_max (논문 기본 28-24)
+    n_skip_tail: int = 0
+    w_src: float = 1.5
+    w_tar: float = 3.5
+    n_avg: int = 1
+    seed: int = 7
+    apg: float = 0.0
+
+
+@app.post("/audedit")
+def audedit(r: AudEditReq):
+    """AudEdit 원격 실측/실행 — 보낸 클립 전체를 target_prompt 방향으로 편집.
+
+    마스크는 없다(전곡 편집) — 구간 보존은 호출자(맥)가 스플라이스로 담보."""
+    with _lock:
+        if _busy():
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    t0 = time.time()
+    try:
+        wav = _decode_wav(r.audio_b64)
+        if wav.shape[1] / SR > 120:
+            wav = wav[:, : int(120 * SR)]
+        out = _audedit_run(wav, r.target_prompt, r.source_prompt,
+                           steps=r.steps, n_skip_head=r.n_skip_head,
+                           n_skip_tail=r.n_skip_tail, w_src=r.w_src,
+                           w_tar=r.w_tar, n_avg=r.n_avg, seed=r.seed,
+                           apg=r.apg, log=_log)
+        return {"ok": True, "elapsed_s": round(time.time() - t0, 1),
+                "audio_b64": _encode_wav(out)}
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={
+            "ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}",
+            "trace": traceback.format_exc(limit=6)})
+
+
+@app.post("/update")
+def update():
+    """원격 자가 업데이트 — git pull 후 종료(_sa3_run.bat 루프가 재기동)."""
+    with _lock:
+        if _busy():
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "-C", repo, "pull"], capture_output=True,
+                             text=True, timeout=120)
+        msg = (out.stdout + out.stderr).strip()[-400:]
+    except Exception as e:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+    _log(f"/update: {msg} — 3초 후 재시작")
+    threading.Timer(3.0, lambda: os._exit(0)).start()
+    return {"ok": True, "git": msg, "restarting": True}
 
 
 @app.post("/unload")
