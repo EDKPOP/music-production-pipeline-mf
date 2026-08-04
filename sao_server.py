@@ -219,23 +219,30 @@ def _load_model(phase=lambda p: None) -> bool:
         dev = "cuda" if torch.cuda.is_available() else "cpu"
         phase("SAO-Instruct 모델 로드 (최초엔 HF 다운로드 수 분)")
         _log(f"모델 로드: {HF_ID}")
-        m = None
-        try:                        # 경로 1 — 공식 README 방식
-            m = SAOInstruct.from_pretrained(HF_ID)
-        except Exception as e1:
-            _log(f"from_pretrained 실패({type(e1).__name__}: {str(e1)[:200]}) "
-                 "— 수동 로드 폴백")
-            # 경로 2 — HF 레포 실구조(config.json=아키텍처, model.pt=가중치)에
-            # 맞춘 수동 조립: mixin 표준(model.safetensors)이 아니라서
-            # from_pretrained 가 깨질 수 있다
-            from huggingface_hub import hf_hub_download
-            cfg_p = hf_hub_download(HF_ID, "config.json")
-            ckpt_p = hf_hub_download(HF_ID, "model.pt")
-            mc = _json.load(open(cfg_p, encoding="utf-8"))
-            _strip_ckpt_paths(mc)
-            patched = os.path.join(tempfile.gettempdir(), "sao_cfg_patched.json")
-            _json.dump(mc, open(patched, "w", encoding="utf-8"))
-            m = SAOInstruct(config_path=patched, checkpoint_path=ckpt_p)
+        # 수동 조립이 기본 경로다 — from_pretrained 는 게이트 저장소
+        # (stabilityai/stable-audio-open-1.0 의 vae_model.ckpt)를 당겨
+        # 403 으로 죽는다 (실측 2026-08-04). 그들의 open()(cp949 함정)도
+        # 우회해 nn.Module 을 직접 조립한다.
+        import torch.nn as _nn
+        from huggingface_hub import hf_hub_download
+        from stable_audio_tools import create_model_from_config
+        from stable_audio_tools.models.utils import load_ckpt_state_dict
+        import pyloudnorm as _pyln
+        cfg_p = hf_hub_download(HF_ID, "config.json")
+        ckpt_p = hf_hub_download(HF_ID, "model.pt")
+        with open(cfg_p, encoding="utf-8") as f:
+            mc = _json.load(f)
+        _strip_ckpt_paths(mc)
+        m = SAOInstruct.__new__(SAOInstruct)
+        _nn.Module.__init__(m)
+        m.model = create_model_from_config(mc)
+        sd = load_ckpt_state_dict(ckpt_p)
+        miss = m.model.load_state_dict(sd, strict=False)
+        if miss.missing_keys or miss.unexpected_keys:
+            _log(f"  state_dict: missing {len(miss.missing_keys)} / "
+                 f"unexpected {len(miss.unexpected_keys)} (strict=False)")
+        m.sample_rate = m.model.sample_rate
+        m.loudnorm_meter = _pyln.Meter(m.sample_rate)
         m = m.eval().to(dev)
         if not hasattr(m, "device"):
             m.device = dev          # edit_audio 가 self.device 를 참조
@@ -245,7 +252,7 @@ def _load_model(phase=lambda p: None) -> bool:
         return True
     except Exception as e:
         _LOAD_ERR["err"] = (f"{type(e).__name__}: {str(e)[:400]}\n"
-                            + traceback.format_exc(limit=4))
+                            + traceback.format_exc(limit=8))
         _log(f"모델 로드 실패: {_LOAD_ERR['err']}")
         return False
 
@@ -428,7 +435,7 @@ def health():
         pass
     return {"status": "ok", "version": VERSION, "cuda": cuda or MOCK,
             "model_loaded": MOCK or _model is not None,
-            "load_error": _LOAD_ERR["err"][:600],
+            "load_error": _LOAD_ERR["err"][:2400],
             "max_audio_s": 600.0, "busy": _busy(),
             "modes": ["stem_edit", "edit"],
             "flash_attn": True, "flash_attn_info": "(sao)",
@@ -441,7 +448,7 @@ def health():
 def load():
     if not _load_model():
         return JSONResponse(status_code=503, content={
-            "error": "모델 로드 실패", "detail": _LOAD_ERR["err"][:1200]})
+            "error": "모델 로드 실패", "detail": _LOAD_ERR["err"][:4000]})
     return {"ok": True, "model_loaded": True}
 
 
@@ -547,6 +554,26 @@ def diag(r: DiagReq):
         return JSONResponse(status_code=500, content={
             "ok": False, "error": f"{type(e).__name__}: {str(e)[:300]}",
             "trace": traceback.format_exc(limit=3)})
+
+
+@app.post("/update")
+def update():
+    """원격 자가 업데이트 — git pull 후 프로세스 종료(래퍼 bat 루프가 새 코드로
+    재기동). 맥의 Claude 가 수정 배포를 사람 손 없이 돌리기 위한 통로."""
+    if _busy():
+        return JSONResponse(status_code=409, content={"error": "busy"})
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "-C", repo, "pull"], capture_output=True,
+                             text=True, timeout=120)
+        msg = (out.stdout + out.stderr).strip()[-400:]
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+    _log(f"/update: {msg} — 3초 후 재시작")
+    threading.Timer(3.0, lambda: os._exit(0)).start()
+    return {"ok": True, "git": msg, "restarting": True}
 
 
 if __name__ == "__main__":
