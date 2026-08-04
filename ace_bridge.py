@@ -544,6 +544,11 @@ def _run_job(job: dict):
 
     t0 = time.time()
     try:
+        # 관리 모드 콜드스타트: upstream 이 내려가 있으면 먼저 스폰해야 한다 —
+        # _ensure_model 을 먼저 부르면 /v1/init 실패 후 20분 폴링에 갇힌다
+        # (실사고 2026-08-04: /load 없이 직접 /edit → 잡이 20분 행)
+        if not _ensure_up(timeout_s=420):
+            raise RuntimeError("ACE 서버(upstream) 기동 실패 — ace-bridge 창 확인")
         if not _ensure_model(lambda p: phase(p, 0.03)):
             raise RuntimeError("ACE 모델 초기화 실패 — ace-api 창을 확인하세요")
         phase("오디오 디코드", 0.05)
