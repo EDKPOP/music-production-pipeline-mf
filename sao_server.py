@@ -269,7 +269,8 @@ def _unload_model():
         _log("모델 언로드 — VRAM 해제")
 
 
-def _edit_clip(wav, instruction, cfg, noise, phase):
+def _edit_clip(wav, instruction, cfg, noise, phase, encode_audio=True,
+               seed=1, steps=None):
     """창(≤45s)을 지시문으로 편집해 같은 길이(2,T)@44.1k 로 반환."""
     if MOCK:
         # 모의: 880Hz 톤을 얹어 '편집됨'을 주파수로 표시 (계약 검증용)
@@ -285,10 +286,13 @@ def _edit_clip(wav, instruction, cfg, noise, phase):
     _MSI.ta.load = lambda p, *a, **k: (torch.from_numpy(
         np.ascontiguousarray(wav)), SR)
     try:
+        kw = {}
+        if steps:
+            kw["steps"] = int(steps)
         clips = _model.edit_audio(
             instructions=[str(instruction)], audio_path="<in-memory>",
-            encode_audio=True, cfg_scale=float(cfg),
-            encoded_audio_noise=float(noise))
+            encode_audio=bool(encode_audio), cfg_scale=float(cfg),
+            encoded_audio_noise=float(noise), seed=int(seed), **kw)
     finally:
         _MSI.ta.load = _orig_load
     c = clips[0]
@@ -525,6 +529,9 @@ class DiagReq(BaseModel):
     audio_b64: str = None
     cfg_scale: float = 6.0
     noise: float = 4.0
+    encode_audio: bool = True    # False = 원본을 조건으로만 (SDEdit 아님)
+    seed: int = 1
+    steps: int = None
     stem: str = None             # 지정 시 해당 스템만 분리해 편집 (순수성 실측)
 
 
@@ -551,7 +558,8 @@ def diag(r: DiagReq):
                 return JSONResponse(status_code=400,
                                     content={"error": f"스템 없음: {r.stem}"})
         out = _edit_clip(wav, r.instruction, r.cfg_scale, r.noise,
-                         lambda p: None)
+                         lambda p: None, encode_audio=r.encode_audio,
+                         seed=r.seed, steps=r.steps)
         return {"ok": True, "elapsed_s": round(time.time() - t0, 1),
                 "rolloff_in": round(_rolloff(wav)),
                 "rolloff_out": round(_rolloff(out)),
