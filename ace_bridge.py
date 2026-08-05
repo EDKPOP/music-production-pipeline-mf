@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v5-multimodel"
+VERSION = "ace-v6-switch"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # 모델 선택 — 실측(2026-08-03, 같은 시드·같은 구간)이 문서 티어 권장을 뒤집음:
@@ -499,42 +499,32 @@ def _models() -> list:
 _MODEL_READY = {"ok": False}
 
 
-def _ensure_model(phase=lambda p: None) -> bool:
-    """DiT 모델 초기화 보장 — ACE 서버는 /v1/init 전엔 모델이 비어 있고
-    /release_task 가 무한 대기한다 (실측: models=[] + POST 120s 타임아웃).
-    기동 시·첫 잡 전에 호출한다. 다운로드 포함 최대 20분 폴링."""
-    def _loaded_ids():
-        return {str(m.get("id", "")).split("/")[-1] for m in _models()}
+def _loaded_model():
+    ids = [str(m.get("id", "")).split("/")[-1] for m in _models()]
+    return ids[0] if ids else None
 
-    if _MODEL_READY["ok"]:
+
+def _ensure_model(phase=lambda p: None, model: str = None) -> bool:
+    """업스트림은 한 번에 한 모델(단일 슬롯, /v1/init 이 교체식 — 실측
+    2026-08-06). 목표 모델이 이미 올라와 있으면 무동작, 아니면 교체 로드."""
+    target = (model or MODEL).strip()
+    if _loaded_model() == target:
         return True
-    missing = [m for m in MODELS if m not in _loaded_ids()]
-    if not missing:
-        _MODEL_READY["ok"] = True
-        return True
-    for m in missing:
-        phase(f"ACE 모델 초기화({m}) — 최초엔 다운로드·로드로 수 분")
-        _log(f"/v1/init 호출 (model={m}, init_llm=True — thinking/lego 용)")
-        try:
-            r = requests.post(f"{UPSTREAM}/v1/init",
-                              json={"model": m, "init_llm": True},
-                              timeout=1800)
-            _log(f"/v1/init 응답: {str(r.text)[:200]}")
-        except Exception as e:
-            _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
+    phase(f"ACE 모델 전환({target}) — 로드 수십 초~수 분")
+    _log(f"/v1/init 호출 (model={target}, init_llm=True)")
+    try:
+        r = requests.post(f"{UPSTREAM}/v1/init",
+                          json={"model": target, "init_llm": True},
+                          timeout=1800)
+        _log(f"/v1/init 응답: {str(r.text)[:200]}")
+    except Exception as e:
+        _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
     for _ in range(120):
-        if not [m for m in MODELS if m not in _loaded_ids()]:
-            _MODEL_READY["ok"] = True
+        if _loaded_model() == target:
             phase("ACE 모델 준비 완료")
-            _log(f"ACE 모델 준비 완료: {sorted(_loaded_ids())}")
+            _log(f"ACE 모델 준비 완료: {target}")
             return True
         time.sleep(10)
-    # 일부만 준비돼도 기본 모델이 있으면 잡은 돌 수 있다 — 경고만 남긴다
-    if MODEL in _loaded_ids():
-        _log(f"⚠ 일부 모델 미준비({[m for m in MODELS if m not in _loaded_ids()]})"
-             " — 기본 모델로 진행")
-        _MODEL_READY["ok"] = True
-        return True
     return False
 
 
@@ -799,6 +789,22 @@ def load():
     return {"ok": True, "model_loaded": True, "model": MODEL}
 
 
+@app.post("/switch")
+def switch(body: dict):
+    """실험용 모델 교체 (단일 슬롯) — /load 는 항상 기본(turbo)으로 돌린다."""
+    model = str((body or {}).get("model") or "").strip()
+    if not model:
+        return JSONResponse(status_code=400, content={"error": "model 필요"})
+    with _lock:
+        if _busy():
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    if not _ensure_up(timeout_s=420):
+        return JSONResponse(status_code=503, content={"error": "upstream 기동 실패"})
+    if not _ensure_model(model=model):
+        return JSONResponse(status_code=503, content={"error": f"{model} 로드 실패"})
+    return {"ok": True, "loaded": model}
+
+
 @app.post("/update")
 def update():
     """원격 자가 업데이트 — git pull 후 프로세스 종료(래퍼 bat 루프가 새 코드로
@@ -906,7 +912,8 @@ def diag(r: DiagReq):
     (맥의 Claude 가 파라미터 실험을 자유롭게 돌리는 통로)."""
     if _busy():
         return JSONResponse(status_code=409, content={"error": "busy"})
-    if not _ensure_model():
+    _want = str((r.raw_task or {}).get("model") or "").strip() or None
+    if not _ensure_model(model=_want):
         return JSONResponse(status_code=503,
                             content={"error": "ACE 모델 초기화 실패 — ace-api 창 확인"})
     info = {"upstream": UPSTREAM, "health": _upstream_ok()}
