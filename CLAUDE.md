@@ -16,8 +16,17 @@ github.com/EDKPOP/music-production-pipeline — **본체의 `docs/HANDOFF.md`와
    차단) → 반주만 Stable Audio 3 인페인팅(구간 ± 문맥 창, 마스크 구간만 재생성)
    → 마스크 밖 원본 스플라이스 + 보컬 재합성(보컬 없는 구간은 스템 미합성 게이트).
    잡 기반(POST /edit → GET /jobs/{id} 폴링 → /jobs/{id}/result).
-   버전 표식: `"sa3-v4-stems"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
+   버전 표식: `"sa3-v5-audedit"`. 본체 클라이언트는 `songcamp/postprod/retouch.py`.
    설치는 README "Stable Audio 3 리터치 서버" 절 (stable-audio-3 uv 환경 공유).
+   `POST /audedit`(AudEdit 속도장 차분 편집 — 실측 보류)과 **`POST /update`
+   (git pull 자가 재기동 — `_sa3_run.bat` 루프 전제)** 포함.
+3. **`ace_bridge.py` (포트 8600)** — ACE-Step 1.5 통역 브리지
+   (`ace-v4-stemroute`): 풀믹스 repaint + **드럼 스템 경로**(`stem_repaint`
+   — 유일하게 귀 합격한 드럼 리듬·필인 경로) + upstream 스폰/종료로 GPU 교대.
+4. **`sao_server.py` (포트 8700)** — SAO-Instruct 편집 서버. **실측 불합격
+   판정(2026-08-05)으로 기본 미사용** — 본체 `retouch.sao_enable=1` 때만
+   라우팅됨. `/update` 자가 배포 있음. 판정 근거는 본체
+   `docs/HANDOFF.md` §0 (재도전 전에 반드시 읽을 것).
 
 ### GPU 중재 (24GB를 MF 16GB + SA3 6.5GB가 나눠 쓰는 방법)
 
