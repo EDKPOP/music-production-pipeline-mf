@@ -40,6 +40,11 @@ UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 #   xl-base: 평탄도 0.102·538Hz(잡음·먹먹) / turbo 계열: 0.057·1080Hz·2배 빠름.
 # repaint 워크로드에선 turbo 가 우세 — XL 은 이득 없음. (gs 는 base 전용)
 MODEL = os.environ.get("ACE_MODEL", "acestep-v15-turbo")
+# 멀티모델 — 쉼표 목록을 전부 /v1/init (raw_task 의 model 필드로 선택 가능).
+# base 는 lego(트랙 단위 작곡)·guidance 실동작·extract 용 (turbo 는 gs 를
+# 파이프라인이 1.0 으로 강제 — 공식 문서 INFERENCE.md).
+MODELS = [m.strip() for m in
+          os.environ.get("ACE_MODELS", MODEL).split(",") if m.strip()]
 STEPS = int(os.environ.get("ACE_STEPS", 8))      # turbo 권장 8
 ACE_DIR = os.environ.get("ACE_DIR", "")          # 설정 시 브리지가 upstream 수명 관리
 _proc = None                                     # 관리 중인 acestep-api 프로세스
@@ -498,25 +503,38 @@ def _ensure_model(phase=lambda p: None) -> bool:
     """DiT 모델 초기화 보장 — ACE 서버는 /v1/init 전엔 모델이 비어 있고
     /release_task 가 무한 대기한다 (실측: models=[] + POST 120s 타임아웃).
     기동 시·첫 잡 전에 호출한다. 다운로드 포함 최대 20분 폴링."""
-    if _MODEL_READY["ok"] or _models():
+    def _loaded_ids():
+        return {str(m.get("id", "")).split("/")[-1] for m in _models()}
+
+    if _MODEL_READY["ok"]:
+        return True
+    missing = [m for m in MODELS if m not in _loaded_ids()]
+    if not missing:
         _MODEL_READY["ok"] = True
         return True
-    phase("ACE 모델 초기화 요청 — 최초엔 다운로드·로드로 수 분")
-    _log(f"/v1/init 호출 (model={MODEL}, init_llm=True — thinking 용)")
-    try:
-        r = requests.post(f"{UPSTREAM}/v1/init",
-                          json={"model": MODEL, "init_llm": True},
-                          timeout=1800)
-        _log(f"/v1/init 응답: {str(r.text)[:200]}")
-    except Exception as e:
-        _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
+    for m in missing:
+        phase(f"ACE 모델 초기화({m}) — 최초엔 다운로드·로드로 수 분")
+        _log(f"/v1/init 호출 (model={m}, init_llm=True — thinking/lego 용)")
+        try:
+            r = requests.post(f"{UPSTREAM}/v1/init",
+                              json={"model": m, "init_llm": True},
+                              timeout=1800)
+            _log(f"/v1/init 응답: {str(r.text)[:200]}")
+        except Exception as e:
+            _log(f"/v1/init 예외({type(e).__name__}: {e}) — 폴링으로 준비 확인")
     for _ in range(120):
-        if _models():
+        if not [m for m in MODELS if m not in _loaded_ids()]:
             _MODEL_READY["ok"] = True
             phase("ACE 모델 준비 완료")
-            _log("ACE 모델 준비 완료")
+            _log(f"ACE 모델 준비 완료: {sorted(_loaded_ids())}")
             return True
         time.sleep(10)
+    # 일부만 준비돼도 기본 모델이 있으면 잡은 돌 수 있다 — 경고만 남긴다
+    if MODEL in _loaded_ids():
+        _log(f"⚠ 일부 모델 미준비({[m for m in MODELS if m not in _loaded_ids()]})"
+             " — 기본 모델로 진행")
+        _MODEL_READY["ok"] = True
+        return True
     return False
 
 

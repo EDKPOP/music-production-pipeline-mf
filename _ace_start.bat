@@ -41,6 +41,8 @@ if errorlevel 1 (
 
 set "ACE_DIR=%ACEDIR%"
 set "ACE_MODEL=acestep-v15-turbo"
+rem base 동시 초기화 - lego(트랙 작곡)/guidance 실동작/extract 용
+set "ACE_MODELS=acestep-v15-turbo,acestep-v15-base"
 echo      브리지 시작 - 새 창 "ace-bridge 8600" (upstream 은 리터치 시작 때 자동 기동)
 start "ace-bridge 8600" cmd /k "%~dp0_ace_bridge.bat"
 exit /b 0
