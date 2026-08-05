@@ -33,7 +33,7 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-VERSION = "ace-v4-stemroute"
+VERSION = "ace-v5-multimodel"
 SR = 44100                    # 송캠프 계약 SR — ACE(48k) 결과를 여기로 리샘플
 UPSTREAM = os.environ.get("ACE_UPSTREAM", "http://127.0.0.1:8001").rstrip("/")
 # 모델 선택 — 실측(2026-08-03, 같은 시드·같은 구간)이 문서 티어 권장을 뒤집음:
@@ -895,6 +895,7 @@ class DiagReq(BaseModel):
                    "rolls, busy percussion. 130 BPM.")
     raw_task: dict = None        # ACE 원 API 패스스루 — 원격 실측 만능 통로
     src_audio_b64: str = None    # raw_task 의 src_audio
+    raw_timeout_s: float = None  # base(50스텝)+LM 은 240s 를 넘긴다 — 상한 1200
 
 
 @app.post("/diag")
@@ -915,10 +916,10 @@ def diag(r: DiagReq):
         info["models"] = f"조회 실패: {type(e).__name__}"
     out = {"info": info, "results": {}}
 
-    def run_case(name, data, src=None):
+    def run_case(name, data, src=None, timeout=240.0):
         t0 = time.time()
         try:
-            wav = _ace_task(data, src_wav=src, timeout_s=240)
+            wav = _ace_task(data, src_wav=src, timeout_s=timeout)
             out["results"][name] = {"ok": True,
                                     "elapsed_s": round(time.time() - t0, 1),
                                     "shape": list(wav.shape),
@@ -931,7 +932,8 @@ def diag(r: DiagReq):
 
     if r.raw_task:
         src = _decode_wav(r.src_audio_b64) if r.src_audio_b64 else None
-        run_case("raw", dict(r.raw_task), src=src)
+        run_case("raw", dict(r.raw_task), src=src,
+                 timeout=min(max(float(r.raw_timeout_s or 240), 60.0), 1200.0))
         return out
     # 기본 배터리: 순수 생성 → repaint(합성음 또는 보낸 실곡)
     run_case("t2a", {"task_type": "text2music", "prompt": r.prompt,
