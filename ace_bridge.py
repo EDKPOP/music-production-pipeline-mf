@@ -781,6 +781,32 @@ def load():
     return {"ok": True, "model_loaded": True, "model": MODEL}
 
 
+@app.post("/update")
+def update():
+    """원격 자가 업데이트 — git pull 후 프로세스 종료(래퍼 bat 루프가 새 코드로
+    재기동). sao/sa3 서버와 같은 통로. upstream 은 종료해 고아를 남기지 않는다."""
+    with _lock:
+        if _busy():
+            return JSONResponse(status_code=409, content={"error": "busy"})
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(__file__))
+    try:
+        out = subprocess.run(["git", "-C", repo, "pull"], capture_output=True,
+                             text=True, timeout=120)
+        msg = (out.stdout + out.stderr).strip()[-400:]
+    except Exception as e:
+        return JSONResponse(status_code=500,
+                            content={"error": f"{type(e).__name__}: {e}"})
+    _log(f"/update: {msg} — 3초 후 재시작")
+
+    def _bye():
+        _kill_upstream()
+        os._exit(0)
+
+    threading.Timer(3.0, _bye).start()
+    return {"ok": True, "git": msg, "restarting": True}
+
+
 @app.post("/edit")
 def edit(r: EditReq):
     edits = []
